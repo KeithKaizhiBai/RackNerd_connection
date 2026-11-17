@@ -1,0 +1,545 @@
+#!/usr/bin/python3
+"""WireGuard IPv4 gateway for a fresh, dedicated Ubuntu 24.04 VPS."""
+
+import argparse
+import base64
+from contextlib import contextmanager
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+IFACE, TABLE = "rn-public", "rn_public_gateway"
+SERVER, CLIENT = "10.203.84.1", "10.203.84.2"
+PROGRAM = Path("/usr/local/sbin/rn-gateway")
+SERVICE = "rn-public-gateway.service"
+UNIT = Path("/etc/systemd/system") / SERVICE
+DATA, RUNTIME = Path("/var/lib/rn-public-gateway"), Path("/run/rn-public-gateway")
+KEY, SETTINGS, ACTIVE = DATA / "server.key", DATA / "settings.json", DATA / "active.json"
+TRIAL, APPLIED = RUNTIME / "trial.json", RUNTIME / "applied.json"
+IPV4_CONF = Path("/proc/sys/net/ipv4/conf")
+TRIAL_SECONDS = 600
+UNIT_TEXT = f"""[Unit]
+Description=Dedicated WireGuard IPv4 internet gateway
+Wants=network-online.target
+After=network-online.target systemd-sysctl.service nftables.service ufw.service
+ConditionPathExists=|/run/rn-public-gateway/trial.json
+ConditionPathExists=|/var/lib/rn-public-gateway/active.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=75s
+TimeoutStopSec=30s
+ExecStart={PROGRAM} _up
+ExecStopPost={PROGRAM} _down
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# Includes provider metadata, private addresses, multicast and special-use space.
+SPECIAL = """0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16
+172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.31.196.0/24 192.52.193.0/24
+192.88.99.0/24 192.168.0.0/16 192.175.48.0/24 198.18.0.0/15
+198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4""".split()
+
+
+def require(ok, message):
+    if not ok:
+        raise RuntimeError(message)
+
+
+def run(*args, data=None):
+    label = " ".join(args[:2])
+    timeout = 115 if args[:2] == ("systemctl", "start") else 40
+    try:
+        result = subprocess.run(args, input=data, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{label} exceeded {timeout} seconds.") from None
+    if result.returncode:
+        # Never echo command arguments or stdin. In particular wg pubkey reads a secret.
+        raise RuntimeError(f"{label} failed ({result.returncode}): {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def jrun(*args):
+    return json.loads(run(*args))
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def atomic(path, text, mode=0o600):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+        tmp = Path(out.name)
+        try:
+            os.fchmod(out.fileno(), mode)
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+            os.replace(tmp, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def save(path, value):
+    atomic(path, json.dumps(value) + "\n")
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    info = path.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o077 == 0,
+            f"Unsafe ownership or permissions: {path}")
+
+
+@contextmanager
+def lock(name):
+    import fcntl
+    with (RUNTIME / name).open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def public_key(raw):
+    value = base64.b64decode(raw, validate=True)
+    require(len(value) == 32 and any(value) and base64.b64encode(value).decode() == raw,
+            "Expected a canonical WireGuard public key.")
+    return raw
+
+
+def server_public():
+    info = KEY.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o077 == 0,
+            f"Unsafe server key permissions: {KEY}")
+    return public_key(run("wg", "pubkey", data=KEY.read_text()))
+
+
+def port_number(value):
+    port = int(value)
+    require(1 <= port <= 65535, "UDP port must be between 1 and 65535.")
+    require(port not in (53, 853), "The Windows client reserves DNS ports 53 and 853. Choose a different UDP port.")
+    return port
+
+
+def configured_port(override=None):
+    if override is not None:
+        return port_number(override)
+    return port_number(read(SETTINGS)["port"]) if SETTINGS.exists() else 51820
+
+
+def topology():
+    routes = jrun("ip", "-j", "-4", "route", "show", "table", "main")
+    defaults = [r for r in routes if r.get("dst") == "default"]
+    require(len(defaults) == 1 and "gateway" in defaults[0], "Expected one IPv4 default gateway.")
+    wan = defaults[0].get("dev", "")
+    require(re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", wan) and wan not in ("lo", IFACE),
+            "Unsupported uplink name or multipath route.")
+    links = jrun("ip", "-j", "link", "show")
+    require({v["ifname"] for v in links} == {"lo", wan},
+            "Expected only loopback and one uplink; use an administrator-integrated deployment.")
+    rules = jrun("ip", "-j", "-4", "rule", "show")
+    layout = {(r["priority"], str(r["table"])) for r in rules}
+    require(len(rules) == 3 and layout == {(0, "local"), (32766, "main"), (32767, "default")}
+            and all(r.get("src", "all") == "all" and set(r) <=
+                    {"priority", "src", "table", "protocol", "flags", "action"} for r in rules),
+            "Custom IPv4 policy routing detected.")
+    excluded = [ipaddress.IPv4Network(x) for x in SPECIAL + [defaults[0]["gateway"]]]
+    for route in routes:
+        if route.get("dst") == "default":
+            continue
+        require(route.get("scope") == "link" and route.get("dev") == wan and not route.get("gateway"),
+                "Custom non-default IPv4 routes detected.")
+        subnet = ipaddress.IPv4Network(route["dst"], strict=False)
+        require(all(ipaddress.IPv4Address(x) not in subnet for x in (SERVER, CLIENT)),
+                "Tunnel address overlaps an existing route.")
+        excluded.append(subnet)
+    addresses = jrun("ip", "-j", "-4", "address", "show", "dev", wan)[0]["addr_info"]
+    public_ips = [v["local"] for v in addresses if ipaddress.IPv4Address(v["local"]).is_global]
+    require(len(addresses) == 1 and len(public_ips) == 1, "Expected one directly assigned public IPv4.")
+    return {"wan": wan, "index": next(v["ifindex"] for v in links if v["ifname"] == wan),
+            "public": public_ips[0], "excluded": [str(n) for n in ipaddress.collapse_addresses(excluded)]}
+
+
+def systemd_property(unit, prop):
+    return run("systemctl", "show", unit, "--property=" + prop, "--value")
+
+
+def check_unit():
+    fragment = systemd_property(SERVICE, "FragmentPath")
+    require(not fragment or fragment == str(UNIT), "A different service already owns the unit name.")
+    require(not systemd_property(SERVICE, "DropInPaths"), "Existing service drop-in detected.")
+    if UNIT.is_symlink() or UNIT.exists():
+        require(not UNIT.is_symlink() and UNIT.is_file() and UNIT.read_text() == UNIT_TEXT
+                and UNIT.stat().st_uid == 0 and UNIT.stat().st_mode & 0o022 == 0,
+                f"Foreign or modified service file: {UNIT}")
+
+
+def preflight(port):
+    os_info = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines()
+                   if "=" in line)
+    require(os_info.get("ID", "").strip('"') == "ubuntu" and os_info.get("VERSION_ID", "").strip('"') == "24.04",
+            "This automatic deployment supports Ubuntu 24.04 only.")
+    require(Path("/run/systemd/system").is_dir(), "systemd must be the system manager.")
+    for tool in ("wg", "ip", "ss", "nft", "systemctl", "systemd-run", "iptables-legacy-save", "ip6tables-legacy-save"):
+        require(shutil.which(tool), f"Missing {tool}. See server/README.md for Ubuntu packages.")
+    check_unit()
+    require(not Path(f"/etc/wireguard/{IFACE}.conf").exists() and not run("wg", "show", "interfaces"),
+            "Another WireGuard profile or interface exists.")
+    require(not run("nft", "list", "tables"), "Existing nftables tables. Integrate with the firewall owner.")
+    for tool in ("iptables-legacy-save", "ip6tables-legacy-save"):
+        rules = run(tool)
+        require(not any(line.startswith("-") or (line.startswith(":") and line.split()[1] != "ACCEPT")
+                        for line in rules.splitlines()), f"Existing firewall rules in {tool}.")
+    if shutil.which("ufw") or Path("/etc/ufw/ufw.conf").exists():
+        ufw_conf = Path("/etc/ufw/ufw.conf").read_text()
+        require(re.findall(r"^\s*ENABLED\s*=\s*([^\s#]+)", ufw_conf, re.M) == ["no"],
+                "UFW is enabled or has unrecognized configuration.")
+    for unit in ("nftables.service", "firewalld.service", "netfilter-persistent.service", "fail2ban.service",
+                 "docker.service", "docker.socket", "tailscaled.service", "libvirtd.service"):
+        active = systemd_property(unit, "ActiveState")
+        enabled = systemd_property(unit, "UnitFileState")
+        require(active in ("inactive", "failed") and not enabled.startswith(("enabled", "linked", "alias")),
+                f"{unit} can manage routing/firewall rules. Use its own configuration.")
+    require(all(p.read_text().strip() == "0" for p in IPV4_CONF.glob("*/forwarding")),
+            "IPv4 forwarding is already in use.")
+    require(not run("ss", "-H", "-u", "-a", "-n", "sport", "=", f":{port}"), "UDP port already in use.")
+    return topology()
+
+
+def nft_rules(net, token):
+    wan = net["wan"]
+    excluded = ", ".join(net["excluded"])
+    # Creation is exclusive and the whole batch is a single nftables transaction.
+    prefix = f"ip {TABLE}"
+    return f"""create table {prefix}
+add chain {prefix} owned_{token}
+add set {prefix} non_internet {{ type ipv4_addr; flags interval; }}
+add element {prefix} non_internet {{ {excluded} }}
+add chain {prefix} input {{ type filter hook input priority filter; policy accept; }}
+add rule {prefix} input iifname "{IFACE}" ip saddr {CLIENT} ip daddr {SERVER} icmp type echo-request counter accept
+add rule {prefix} input iifname "{IFACE}" counter drop
+add chain {prefix} forward {{ type filter hook forward priority filter; policy accept; }}
+add rule {prefix} forward iifname "{IFACE}" ip daddr @non_internet counter drop
+add rule {prefix} forward iifname "{IFACE}" oifname "{wan}" ip saddr {CLIENT} ct state {{ new, established, related }} counter accept
+add rule {prefix} forward iifname "{IFACE}" counter drop
+add rule {prefix} forward iifname "{wan}" oifname "{IFACE}" ip daddr {CLIENT} ct state {{ established, related }} counter accept
+add rule {prefix} forward iifname "{wan}" counter drop
+add rule {prefix} forward oifname "{IFACE}" counter drop
+add chain {prefix} wan_masquerade {{ type nat hook postrouting priority srcnat; policy accept; }}
+add rule {prefix} wan_masquerade iifname "{IFACE}" oifname "{wan}" ip saddr {CLIENT} ip daddr != @non_internet counter masquerade
+"""
+
+
+def link_details():
+    return {v["ifname"]: v for v in jrun("ip", "-j", "-d", "link", "show")}
+
+
+def owned_table(token):
+    entries = jrun("nft", "-j", "list", "tables")["nftables"]
+    if not any(x.get("table", {}).get("family") == "ip" and x["table"]["name"] == TABLE for x in entries):
+        return False
+    entries = jrun("nft", "-j", "list", "table", "ip", TABLE)["nftables"]
+    require(any(x.get("chain", {}).get("name") == f"owned_{token}" for x in entries),
+            f"Firewall table {TABLE} has foreign ownership.")
+    return True
+
+
+def forwarding(wan, value):
+    (IPV4_CONF / wan / "forwarding").write_text(f"{value}\n")
+
+
+def down():
+    if not APPLIED.exists():
+        return
+    s = read(APPLIED)
+    links = link_details()
+    # Close ingress before removing packet filters. A replacement uplink has its own settings.
+    if s["wan_touched"] and links.get(s["wan"], {}).get("ifindex") == s["index"]:
+        forwarding(s["wan"], 0)
+    if IFACE in links:
+        require(links[IFACE].get("ifalias") == "rn-public-gateway:" + s["token"],
+                f"Interface {IFACE} has foreign ownership.")
+        run("ip", "link", "delete", "dev", IFACE)
+    if owned_table(s["token"]):
+        run("nft", "delete", "table", "ip", TABLE)
+    APPLIED.unlink()
+
+
+def up():
+    cfg = read(ACTIVE if ACTIVE.exists() else TRIAL)
+    if not ACTIVE.exists():
+        require(time.monotonic() < cfg["deadline"], "Trial expired before activation.")
+    require(not APPLIED.exists(), "Previous activation still needs rollback.")
+    net = preflight(cfg["port"])
+    token = cfg["token"]
+    rules = nft_rules(net, token)
+    run("nft", "--check", "-f", "-", data=rules)
+    state = {"token": token, "wan": net["wan"], "index": net["index"], "wan_touched": False}
+    save(APPLIED, state)
+    run("nft", "-f", "-", data=rules)
+    run("ip", "link", "add", "name", IFACE, "alias", "rn-public-gateway:" + token, "type", "wireguard")
+    run("wg", "set", IFACE, "private-key", str(KEY), "listen-port", str(cfg["port"]),
+        "peer", cfg["peer"], "allowed-ips", CLIENT + "/32")
+    run("ip", "-4", "address", "add", SERVER + "/32", "dev", IFACE)
+    wan_mtu = int(link_details()[net["wan"]]["mtu"])
+    require(wan_mtu >= 1360, "Uplink MTU too small for this profile.")
+    run("ip", "link", "set", "dev", IFACE, "mtu", str(min(1420, wan_mtu - 80)), "up")
+    run("ip", "-4", "route", "add", CLIENT + "/32", "dev", IFACE)
+    forwarding(IFACE, 1)
+    state["wan_touched"] = True
+    save(APPLIED, state)
+    forwarding(net["wan"], 1)
+    print("WireGuard interface, scoped NAT and IPv4 forwarding are active.")
+
+
+def ssh_session():
+    fields = os.environ.get("SSH_CONNECTION", "").split()
+    require(len(fields) == 4, "Use a new direct SSH login as root; SSH_CONNECTION is required.")
+    remote, source_port, local, listen_port = fields
+    ipaddress.ip_address(remote)
+    require(ipaddress.IPv4Address(local).is_global and 0 < int(source_port) < 65536 and
+            0 < int(listen_port) < 65536, "Expected the VPS public IPv4 SSH connection.")
+    pid, starts = os.getppid(), []
+    while pid > 1:
+        record = Path(f"/proc/{pid}/stat").read_text()
+        name = record[record.index("(") + 1:record.rindex(")")]
+        fields = record[record.rindex(")") + 2:].split()
+        if name in ("sshd", "sshd-session", "sshd-auth"):
+            starts.append(int(fields[19]))
+        pid = int(fields[1])
+    require(starts, "Open a shell or run the command directly through OpenSSH.")
+    return {"remote": remote, "source_port": source_port, "local": local,
+            "listen_port": listen_port, "sshd_start": max(starts)}
+
+
+def timer(token):
+    return "rn-public-trial-" + token
+
+
+def prepare(port):
+    if ACTIVE.exists() or TRIAL.exists():
+        require(port == configured_port(), "Rollback the active configuration before changing the port.")
+    else:
+        preflight(port)
+    private_dir(DATA)
+    if not KEY.exists():
+        require(not SETTINGS.exists() and not ACTIVE.exists(), "A saved deployment lost its key; recover your backup.")
+        atomic(KEY, run("wg", "genkey") + "\n")
+    key = server_public()
+    save(SETTINGS, {"port": port})
+    print(key)
+
+
+def ensure_installed():
+    require(Path(__file__).resolve() == PROGRAM and not PROGRAM.is_symlink() and PROGRAM.stat().st_uid == 0
+            and not PROGRAM.stat().st_mode & 0o022, f"Install the root-owned script at {PROGRAM}.")
+
+
+def install_unit():
+    check_unit()
+    if not UNIT.exists():
+        atomic(UNIT, UNIT_TEXT, 0o644)
+    run("systemctl", "daemon-reload")
+
+
+def stage(peer):
+    ensure_installed()
+    public_key(peer)
+    require(peer != server_public(), "The Windows and server keys must differ.")
+    require(not ACTIVE.exists(), "Already committed. Use status or rollback.")
+    if TRIAL.exists():
+        pending = read(TRIAL)
+        if (time.monotonic() < pending["deadline"] and
+                systemd_property(timer(pending["token"]) + ".timer", "ActiveState") == "active" and
+                systemd_property(SERVICE, "ActiveState") == "active"):
+            require(pending["peer"] == peer, "A different trial is pending.")
+            print("This trial already exists. Use status; its original deadline still applies.")
+            return
+        with lock("decision.lock"):
+            rollback()
+    require(not APPLIED.exists(), "Previous activation still needs rollback.")
+    port = configured_port()
+    net = preflight(port)
+    ssh = ssh_session()
+    require(ssh["local"] == net["public"], "Open SSH to the VPS uplink's public IPv4.")
+    install_unit()
+    # Repair a power loss between enabling the unit and persisting its committed marker.
+    if systemd_property(SERVICE, "UnitFileState") == "enabled":
+        run("systemctl", "disable", SERVICE)
+    require(systemd_property(SERVICE, "UnitFileState") == "disabled" and
+            systemd_property(SERVICE, "ActiveState") in ("inactive", "failed"),
+            "The gateway service must initially be disabled and stopped.")
+    token = secrets.token_hex(12)
+    ticks = os.sysconf("SC_CLK_TCK")
+    save(TRIAL, {"token": token, "peer": peer, "port": port, "ssh": ssh,
+                 "stage_tick": int(time.clock_gettime(time.CLOCK_BOOTTIME) * ticks),
+                 "deadline": time.monotonic() + TRIAL_SECONDS})
+    try:
+        run("systemd-run", "--unit=" + timer(token), f"--on-active={TRIAL_SECONDS}s", "--timer-property=AccuracySec=1s",
+            "--property=Restart=on-failure", "--property=RestartSec=10s", "--property=StartLimitBurst=3",
+            "--property=StartLimitIntervalSec=120s",
+            str(PROGRAM), "_auto", token)
+        require(systemd_property(timer(token) + ".timer", "ActiveState") == "active", "Rollback timer failed to arm.")
+        run("systemctl", "start", SERVICE)
+        require(TRIAL.exists() and read(TRIAL)["token"] == token, "Trial expired before startup completed.")
+    except BaseException:
+        with lock("decision.lock"):
+            rollback()
+        raise
+    print("Trial started. Open a fresh public SSH connection, then run rn-gateway commit within 10 minutes.")
+
+
+def verify_live(cfg):
+    require(systemd_property(SERVICE, "ActiveState") == "active", "Gateway service is not active.")
+    state = read(APPLIED)
+    require(state["token"] == cfg["token"] and owned_table(cfg["token"]), "Gateway rule ownership changed.")
+    require(link_details().get(IFACE, {}).get("ifalias") == "rn-public-gateway:" + cfg["token"]
+            and all((IPV4_CONF / i / "forwarding").read_text().strip() == "1" for i in (state["wan"], IFACE)),
+            "Gateway interface or forwarding changed.")
+    require(run("wg", "show", IFACE, "listen-port") == str(cfg["port"])
+            and run("wg", "show", IFACE, "public-key") == server_public()
+            and run("wg", "show", IFACE, "allowed-ips").split() == [cfg["peer"], CLIENT + "/32"],
+            "WireGuard key, peer, allowed source or listen port changed.")
+    peer_route = jrun("ip", "-j", "-4", "route", "get", CLIENT)
+    require(peer_route and peer_route[0].get("dev") == IFACE, "The route to the Windows peer changed.")
+
+
+def commit():
+    ensure_installed()
+    if ACTIVE.exists() and not TRIAL.exists():
+        verify_live(read(ACTIVE))
+        print("Already committed.")
+        return
+    require(TRIAL.exists(), "No live trial to commit.")
+    trial = read(TRIAL)
+    require(time.monotonic() < trial["deadline"], "Trial expired. Allow rollback to finish.")
+    ssh, original = ssh_session(), trial["ssh"]
+    require((ssh["remote"], ssh["source_port"]) != (original["remote"], original["source_port"])
+            and (ssh["local"], ssh["listen_port"]) == (original["local"], original["listen_port"])
+            and ssh["sshd_start"] > trial["stage_tick"],
+            "Open a second TCP connection after staging to the same public IPv4 and SSH port; disable multiplexing.")
+    require(systemd_property(timer(trial["token"]) + ".timer", "ActiveState") == "active", "Trial timer is inactive.")
+    verify_live(trial)
+    run("systemctl", "enable", SERVICE)
+    require(time.monotonic() < trial["deadline"], "Trial expired during commit. Automatic rollback is pending.")
+    save(ACTIVE, {k: trial[k] for k in ("token", "port", "peer")})
+    TRIAL.unlink()
+    run("systemctl", "stop", timer(trial["token"]) + ".timer")
+    print("Second public SSH connection verified. Gateway enabled at boot; validate Windows egress separately.")
+
+
+def rollback():
+    if not (ACTIVE.exists() or TRIAL.exists() or APPLIED.exists()):
+        print("No active configuration to roll back.")
+        return
+    check_unit()
+    trial = read(TRIAL) if TRIAL.exists() else None
+    run("systemctl", "disable", SERVICE)
+    ACTIVE.unlink(missing_ok=True)
+    try:
+        run("systemctl", "stop", SERVICE)
+    finally:
+        with lock("service.lock"):
+            down()  # Also handles a previously interrupted or failed service stop.
+    TRIAL.unlink(missing_ok=True)
+    if trial and systemd_property(timer(trial["token"]) + ".timer", "ActiveState") == "active":
+        run("systemctl", "stop", timer(trial["token"]) + ".timer")
+    print("Gateway stopped. Previous uplink forwarding restored; saved server key retained.")
+
+
+def status():
+    cfg = read(ACTIVE) if ACTIVE.exists() else read(TRIAL) if TRIAL.exists() else None
+    if not cfg:
+        print("Prepared; no live gateway." if SETTINGS.exists() else "Not prepared.")
+        if APPLIED.exists():
+            raise RuntimeError("Residual live state detected. Run rollback.")
+        return
+    if ACTIVE.exists():
+        print("Committed. Boot unit: " + systemd_property(SERVICE, "UnitFileState"))
+    else:
+        print(f"Trial. Remaining seconds: {max(0, int(cfg['deadline'] - time.monotonic()))}")
+    verify_live(cfg)
+    print(f"{IFACE}  server={SERVER}/32  client={CLIENT}/32  UDP={cfg['port']}")
+    print("Peer and latest handshake (Unix timestamp; 0 means none):")
+    print(run("wg", "show", IFACE, "latest-handshakes"))
+    print("Peer, received bytes, transmitted bytes:")
+    print(run("wg", "show", IFACE, "transfer"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest="command", required=True)
+    for name in ("preflight", "prepare"):
+        subs.add_parser(name).add_argument("--port", type=int)
+    subs.add_parser("stage").add_argument("windows_public_key")
+    for name in ("public-key", "status", "commit", "rollback"):
+        subs.add_parser(name)
+    # Private entry points for the system service and independently scheduled timer.
+    if len(sys.argv) > 1 and sys.argv[1] in ("_up", "_down", "_auto"):
+        internal = subs.add_parser(sys.argv[1])
+        if sys.argv[1] == "_auto":
+            internal.add_argument("token")
+    a = parser.parse_args()
+    os.environ.update(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL="C")
+    os.umask(0o077)
+    require(sys.platform == "linux" and os.geteuid() == 0, "Run as root on the target Ubuntu VPS.")
+    if a.command == "preflight":
+        net = preflight(configured_port(a.port))
+        run("nft", "--check", "-f", "-", data=nft_rules(net, "preview"))
+        print(f"Ready for a trial. Uplink={net['wan']}  UDP={configured_port(a.port)}")
+        return
+    if a.command == "public-key":
+        print(server_public())
+        return
+    private_dir(RUNTIME)
+    if a.command in ("_up", "_down"):
+        with lock("service.lock"):
+            up() if a.command == "_up" else down()
+        return
+    if a.command == "_auto":
+        # A lost or suspended staging SSH shell may still own control.lock.
+        with lock("decision.lock"):
+            if TRIAL.exists() and read(TRIAL)["token"] == a.token:
+                if ACTIVE.exists() and read(ACTIVE)["token"] == a.token:
+                    TRIAL.unlink()
+                else:
+                    rollback()
+        return
+    with lock("control.lock"):
+        if a.command == "prepare":
+            prepare(configured_port(a.port))
+        elif a.command == "stage":
+            stage(a.windows_public_key)
+        elif a.command == "commit":
+            with lock("decision.lock"):
+                commit()
+        elif a.command == "status":
+            status()
+        elif a.command == "rollback":
+            with lock("decision.lock"):
+                rollback()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as error:
+        sys.exit(f"rn-gateway: {error}")

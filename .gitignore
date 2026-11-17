@@ -1,0 +1,23 @@
+# The repository contains instructions and source only. Local profiles, keys,
+# archives, captures, logs, screenshots and machine reports are private by default.
+*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/docs/
+!/docs/*.md
+!/server/
+!/server/rn-gateway
+!/server/*.sh
+!/server/*.md
+!/windows/
+!/windows/*.ps1
+!/windows/*.md
+!/gui/
+!/gui/*.ps1
+!/gui/*.cmd
+!/gui/*.md
+!/tests/
+!/tests/*.ps1
+!/tests/*.sh
+!/tests/*.md
