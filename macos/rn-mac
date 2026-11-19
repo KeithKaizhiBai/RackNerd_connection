@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""Native macOS WireGuard preparation, read-only checks and bounded trials."""
+
+import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor
+import datetime
+import ipaddress
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import secrets
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+
+ROOT = Path(__file__).resolve().parent.parent
+LOCAL = ROOT / ".local" / "macos"
+ENDPOINT = None  # Loaded from the ignored local settings file by main().
+SCUTIL = "/usr/sbin/scutil"
+LAUNCHCTL = "/bin/launchctl"
+
+
+def run(*args, timeout=20):
+    try:
+        value = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return {"ok": value.returncode == 0, "exit_code": value.returncode,
+                "stdout": value.stdout.strip(), "stderr": value.stderr.strip()[:1000]}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "stdout": "", "stderr": str(error)}
+
+
+def checked(*args, timeout=20):
+    value = run(*args, timeout=timeout)
+    if not value["ok"]:
+        raise RuntimeError("Command failed: " + args[0] + ": " + value["stderr"])
+    return value["stdout"]
+
+
+def private_dir(path):
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError("Expected a user-owned private directory: " + str(path))
+
+
+def save(path, value):
+    private_dir(path.parent)
+    data = json.dumps(value, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def public_key(value):
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        raise ValueError("Invalid WireGuard key encoding") from None
+    if len(raw) != 32 or not any(raw) or base64.b64encode(raw).decode() != value:
+        raise ValueError("Expected a canonical 32-byte WireGuard key")
+    return value
+
+
+def snapshot():
+    commands = {
+        "os": ("/usr/bin/sw_vers",),
+        "interfaces": ("/sbin/ifconfig",),
+        "ipv4_routes": ("/usr/sbin/netstat", "-rn", "-f", "inet"),
+        "ipv6_routes": ("/usr/sbin/netstat", "-rn", "-f", "inet6"),
+        "vpns": (SCUTIL, "--nc", "list"),
+        "dns": (SCUTIL, "--dns"),
+        "proxies": (SCUTIL, "--proxy"),
+        "services": ("/usr/sbin/networksetup", "-listallnetworkservices"),
+    }
+    result = {name: run(*args) for name, args in commands.items()}
+    result["routes_to"] = {address: run("/sbin/route", "-n", "get", address)
+                           for address in ("default", ENDPOINT, "1.1.1.1", "9.9.9.9", "208.67.222.222")}
+    result["proxy_environment_names"] = [name for name in os.environ
+        if name.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")]
+    result["network_services"] = {}
+    if result["services"]["ok"]:
+        for name in result["services"]["stdout"].splitlines():
+            if not name or "asterisk" in name.lower() or name.startswith("An "):
+                continue
+            name = name.lstrip("*").strip()
+            result["network_services"][name] = {
+                flag: run("/usr/sbin/networksetup", flag, name)
+                for flag in ("-getdnsservers", "-getsearchdomains", "-getwebproxy",
+                             "-getsecurewebproxy", "-getsocksfirewallproxy",
+                             "-getautoproxyurl", "-getproxyautodiscovery")}
+    result["captured_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return result
+
+
+def route_identity(record):
+    if not record["ok"]:
+        raise RuntimeError("Route queries are unavailable in this execution environment")
+    fields = {key: value.strip() for key, value in
+              re.findall(r"^\s*(destination|gateway|interface|flags):\s*(.+)$",
+                         record["stdout"], re.M)}
+    if "interface" not in fields:
+        raise RuntimeError("Route query returned no usable interface")
+    return fields
+
+
+def inactive_proxy_settings(output):
+    """Compare scutil snapshots during a trial where all proxy modes must be off."""
+    lines = output.strip().splitlines()
+    if not lines or lines[0] != "<dictionary> {" or lines[-1] != "}":
+        raise RuntimeError("Cannot verify the macOS proxy snapshot")
+    for key, value in re.findall(r"(?m)^\s*(\w+Enable)\s*:\s*([^\n]*)$", output):
+        if value.strip() != "0":
+            raise RuntimeError(f"System proxy setting {key} is active or unrecognized")
+    # With proxying off the exception list has no effect on this connection.
+    # Remove only a complete numbered array and explicit disabled proxy switches.
+    without_exceptions = re.sub(
+        r"(?m)^([ \t]*)ExceptionsList : <array> \{\n(?:[ \t]+\d+ : [^\n]+\n)*\1\}\n", "", output)
+    return tuple(line for line in without_exceptions.strip().splitlines()
+                 if not re.fullmatch(r"\s*(?:HTTP|HTTPS|SOCKS|FTP|RTSP|Gopher|ProxyAutoConfig|ProxyAutoDiscovery)Enable\s*:\s*0\s*", line))
+
+
+def check_endpoint_path(endpoint, physical, ordinary, tunnel_interface):
+    """Check the ordinary lookup and the original interface-scoped underlay."""
+    interface = physical["interface"]
+    if not re.fullmatch(r"en[0-9]+", interface) or not physical.get("gateway"):
+        raise RuntimeError("No physical endpoint gateway in the pre-trial baseline")
+    if ordinary["interface"] == interface:
+        if ordinary.get("gateway") != physical["gateway"]:
+            raise RuntimeError("Physical endpoint gateway changed")
+    elif ordinary["interface"] != tunnel_interface or not re.fullmatch(r"utun[0-9]+", tunnel_interface):
+        raise RuntimeError("Endpoint lookup selected an unexpected interface")
+    scoped = route_identity(run("/sbin/route", "-n", "get", "-ifscope", interface, endpoint))
+    if (scoped["interface"] != interface or scoped.get("gateway") != physical["gateway"]
+            or re.search(r"\b(REJECT|BLACKHOLE)\b", scoped.get("flags", ""))):
+        raise RuntimeError("Original physical endpoint path is unavailable")
+    return scoped
+
+
+def recovery_baseline():
+    state = snapshot()
+    if not state["ipv4_routes"]["ok"]:
+        raise RuntimeError("IPv4 route inventory is unavailable")
+    if not state["dns"]["ok"] or "nameserver" not in state["dns"]["stdout"]:
+        raise RuntimeError("Native DNS state is unavailable; recovery cannot be verified")
+    if not state["proxies"]["ok"]:
+        raise RuntimeError("Native proxy state is unavailable")
+    return {"routes": {key: route_identity(value) for key, value in state["routes_to"].items()},
+            "dns": [line.strip() for line in state["dns"]["stdout"].splitlines()
+                    if re.search(r"nameserver|search domain|^\s*domain\s*:", line)],
+            "proxies": state["proxies"]["stdout"]}
+
+
+def network_identity(state):
+    """Compare a Darwin host clone like its matching physical default route."""
+    routes = state.get("routes", {})
+    parent = routes.get("default", {})
+    if (parent.get("destination") != "default"
+            or parent.get("flags") != "<UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>"
+            or not parent.get("gateway") or not re.fullmatch(r"en[0-9]+", parent.get("interface", ""))):
+        return state
+    comparable = routes.copy()
+    for ip, route in routes.items():
+        if ip == "default":
+            continue
+        expected = dict(parent, destination=ip, flags="<UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF,GLOBAL>")
+        if route == expected:
+            comparable[ip] = parent
+    return dict(state, routes=comparable)
+
+
+PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
+PUBLIC_DER_PREFIX = bytes.fromhex("302a300506032b656e032100")
+
+
+def crypto_command(openssl, *args, data=None):
+    value = subprocess.run([openssl, *args], input=data, capture_output=True, timeout=10)
+    if value.returncode:
+        # Do not echo secret input or text-form key output.
+        raise RuntimeError("OpenSSL X25519 operation failed")
+    return value.stdout
+
+
+def derive_public(openssl, raw_private):
+    encoded = crypto_command(openssl, "pkey", "-inform", "DER", "-pubout", "-outform", "DER",
+                             data=PRIVATE_DER_PREFIX + raw_private)
+    if len(encoded) != len(PUBLIC_DER_PREFIX) + 32 or not encoded.startswith(PUBLIC_DER_PREFIX):
+        raise RuntimeError("Unexpected X25519 public encoding (RFC 8410)")
+    return base64.b64encode(encoded[len(PUBLIC_DER_PREFIX):]).decode()
+
+
+def keygen():
+    private_dir(LOCAL)
+    openssl = next((p for p in ("/opt/homebrew/opt/openssl@3/bin/openssl",
+                               "/usr/local/opt/openssl@3/bin/openssl") if Path(p).is_file()), None)
+    if openssl is None:
+        raise RuntimeError("Install OpenSSL 3 from Homebrew, or generate a key in the official WireGuard app")
+    key_path, pub_path = LOCAL / "macbook.key", LOCAL / "macbook.pub"
+    if key_path.exists():
+        for path in (key_path, pub_path):
+            if path.exists() and (not stat.S_ISREG(path.lstat().st_mode) or
+                                  path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
+                raise RuntimeError("Unsafe existing key file permissions")
+        raw_private = base64.b64decode(public_key(key_path.read_text().strip()))
+    else:
+        if pub_path.exists():
+            raise RuntimeError("Public identity exists without its private key")
+        encoded = crypto_command(openssl, "genpkey", "-algorithm", "X25519", "-outform", "DER")
+        if len(encoded) != len(PRIVATE_DER_PREFIX) + 32 or not encoded.startswith(PRIVATE_DER_PREFIX):
+            raise RuntimeError("Unexpected X25519 private encoding (RFC 8410)")
+        raw_private = encoded[len(PRIVATE_DER_PREFIX):]
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(base64.b64encode(raw_private).decode() + "\n")
+    public = public_key(derive_public(openssl, raw_private))
+    if pub_path.exists():
+        if pub_path.read_text().strip() != public:
+            raise RuntimeError("Existing Mac key pair does not match")
+    else:
+        fd = os.open(pub_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(public + "\n")
+    print("MacBook public key: " + public)
+    print("Private key saved locally; existing identity is reused.")
+
+
+def validate_profile_inventory(data, iface, address, mac_public):
+    if data.get("schema") != "racknerd-live-inventory/1":
+        raise ValueError("Use a fresh server/inspect-live.py inventory")
+    stamp = datetime.datetime.fromisoformat(data["captured_at_utc"])
+    age = (datetime.datetime.now(datetime.timezone.utc) - stamp).total_seconds()
+    if not 0 <= age <= 3600:
+        raise ValueError("VPS inventory must be less than one hour old")
+    wireguard = data["wireguard"]
+    if iface not in wireguard:
+        raise ValueError("Selected WireGuard interface is absent in the live inventory")
+    peer = wireguard[iface]
+    if not peer["listen-port"]["ok"] or peer["listen-port"]["value"] != "51820":
+        raise ValueError("Live WireGuard port differs from the requested endpoint")
+    if not peer["public-key"]["ok"]:
+        raise ValueError("VPS public key is unavailable")
+    server_public = public_key(peer["public-key"]["value"])
+    candidate = ipaddress.IPv4Address(address)
+    if not any(candidate in ipaddress.IPv4Network(cidr) for cidr in
+               ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
+        raise ValueError("Choose a confirmed private tunnel IPv4 address")
+    if server_public == mac_public:
+        raise ValueError("Mac and VPS must have independent keys")
+    for config in wireguard.values():
+        if not config["allowed-ips"]["ok"] or not config["peers"]["ok"]:
+            raise ValueError("Existing peer inventory is incomplete")
+        if mac_public in config["peers"]["value"].split():
+            raise ValueError("This Mac public key is already enrolled; inspect its existing address first")
+        for line in config["allowed-ips"]["value"].splitlines():
+            fields = line.split(None, 1)
+            if len(fields) != 2:
+                raise ValueError("Invalid AllowedIPs inventory")
+            for prefix in fields[1].replace(",", " ").split():
+                if prefix == "(none)":
+                    continue
+                network = ipaddress.ip_network(prefix)
+                if network.version == 4 and candidate in network:
+                    raise ValueError("Mac address overlaps an existing peer's AllowedIPs")
+    addresses = data["ipv4_addresses"]
+    routes = data["ipv4_routes"]
+    if not addresses["ok"] or not routes["ok"]:
+        raise ValueError("VPS address or route inventory is incomplete")
+    server_addresses = []
+    endpoint_found = False
+    for link in addresses["value"]:
+        for item in link.get("addr_info", []):
+            if item.get("family") != "inet":
+                continue
+            if item["local"] == str(candidate):
+                raise ValueError("Mac address is already assigned on the VPS")
+            endpoint_found |= item["local"] == ENDPOINT
+            if link["ifname"] == iface:
+                server_addresses.append(item["local"])
+    if len(server_addresses) != 1 or not endpoint_found:
+        raise ValueError("Expected one tunnel IPv4 and the requested public endpoint on the VPS")
+    for route in routes["value"]:
+        dst = route.get("dst", "default")
+        if dst != "default" and candidate in ipaddress.IPv4Network(dst, strict=False):
+            if route.get("dev") != iface or ipaddress.IPv4Network(dst, strict=False).prefixlen == 32:
+                raise ValueError("Mac address conflicts with a live VPS route")
+    return server_public, server_addresses[0]
+
+
+def profile(args):
+    private_dir(LOCAL)
+    private_path, public_path = LOCAL / "macbook.key", LOCAL / "macbook.pub"
+    for path in (private_path, public_path):
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeError("Unsafe local key file permissions")
+    mac_private = public_key(private_path.read_text().strip())
+    mac_public = public_key(public_path.read_text().strip())
+    data = json.loads(Path(args.inventory).read_text())
+    server, gateway = validate_profile_inventory(data, args.interface, args.address, mac_public)
+    # IPv6 is captured locally; the server's IPv4-only AllowedIPs rejects its source.
+    sink = ipaddress.IPv6Address((0xfd << 120) | (secrets.randbits(40) << 80) | 1)
+    base = f"[Interface]\nPrivateKey = {mac_private}\n"
+    peer = (f"\n[Peer]\nPublicKey = {server}\nEndpoint = {ENDPOINT}:51820\n"
+            "PersistentKeepalive = 25\n")
+    profiles = {
+        "RackNerd-Mac-Probe.conf": base + f"Address = {args.address}/32\nMTU = 1380\n" +
+            peer + f"AllowedIPs = {gateway}/32\n",
+        "RackNerd-Mac.conf": base + f"Address = {args.address}/32, {sink}/128\n" +
+            "DNS = 1.1.1.1, 9.9.9.9\nMTU = 1380\n" + peer +
+            "AllowedIPs = 0.0.0.0/0, ::/1, 8000::/1\n",
+    }
+    if any((LOCAL / name).exists() for name in profiles):
+        raise RuntimeError("Local profile already exists; inspect it before replacing an imported identity")
+    for name, text in profiles.items():
+        fd = os.open(LOCAL / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+    save(LOCAL / "enrollment.json", {"endpoint": ENDPOINT, "interface": args.interface, "address": args.address,
+         "gateway": gateway, "mac_public_key": mac_public, "server_public_key": server,
+         "ipv6_sink": str(sink)})
+    print("Prepared probe and full profiles in " + str(LOCAL) + ". Nothing imported or activated.")
+
+
+def resolve_tunnel(name):
+    output = checked(SCUTIL, "--nc", "list")
+    matches = []
+    for line in output.splitlines():
+        match = re.search(r"([0-9A-Fa-f-]{36}).*?\"([^\"]+)\"", line)
+        if match and name in (match[1], match[2]) and "com.wireguard.macos" in line:
+            matches.append(match[1])
+    if len(matches) != 1:
+        raise RuntimeError("Select one imported official WireGuard tunnel by name or UUID")
+    return matches[0]
+
+
+def tunnel_status(tunnel):
+    return checked(SCUTIL, "--nc", "status", tunnel).splitlines()[0]
+
+
+def stop_tunnel(tunnel):
+    checked(SCUTIL, "--nc", "stop", tunnel)
+    until = time.monotonic() + 10
+    while time.monotonic() < until:
+        if tunnel_status(tunnel) == "Disconnected":
+            return
+        time.sleep(0.25)
+    raise RuntimeError("Tunnel did not disconnect; disable it in the official WireGuard app")
+
+
+def arm_recovery(tunnel, seconds, probe_baseline=None):
+    private_dir(LOCAL)
+    name = "com.racknerd.mac-trial." + secrets.token_hex(6)
+    path = LOCAL / (name + ".plist")
+    record = LOCAL / (name + ".json")
+    save(record, {"tunnel": tunnel, "seconds": seconds, "label": name, "ready": False,
+                  "probe_baseline": probe_baseline, "endpoint": ENDPOINT})
+    with path.open("wb") as handle:
+        os.chmod(path, 0o600)
+        plistlib.dump({"Label": name, "RunAtLoad": True,
+                      "ProgramArguments": [sys.executable, str(Path(__file__).resolve()),
+                                           "_recover", str(record)]}, handle)
+    domain = "gui/" + str(os.getuid())
+    checked(LAUNCHCTL, "bootstrap", domain, str(path))
+    checked(LAUNCHCTL, "print", domain + "/" + name)
+    until = time.monotonic() + 5
+    while time.monotonic() < until:
+        value = json.loads(record.read_text())
+        if value.get("ready"):
+            return record
+        time.sleep(0.1)
+    raise RuntimeError("Recovery process did not acknowledge startup; no tunnel was started")
+
+
+def recover(record):
+    global ENDPOINT
+    value = json.loads(record.read_text())
+    value["ready"] = True
+    save(record, value)
+    time.sleep(value["seconds"])
+    baseline = value.get("probe_baseline")
+    was_connected = False
+    if baseline is not None:
+        try:
+            was_connected = tunnel_status(value["tunnel"]) == "Connected"
+        except (RuntimeError, IndexError):
+            pass  # Always attempt the timed stop.
+    try:
+        stop_tunnel(value["tunnel"])
+        value["recovered"] = True
+    except RuntimeError as error:
+        value.update(recovered=False, error=str(error))
+    if baseline is not None and was_connected and value.get("recovered"):
+        ENDPOINT = value["endpoint"]
+        try:
+            if network_identity(recovery_baseline()) == network_identity(baseline):
+                save(LOCAL / "probe-restored.json", {"tunnel": value["tunnel"], "endpoint": ENDPOINT,
+                     "network": baseline, "time": time.time()})
+        except RuntimeError as error:
+            value["baseline_error"] = str(error)
+    save(record, value)
+
+
+def recovery_test(name):
+    tunnel = resolve_tunnel(name)
+    if tunnel_status(tunnel) != "Disconnected":
+        raise RuntimeError("Test recovery against an inactive RackNerd tunnel")
+    before = recovery_baseline()
+    record = arm_recovery(tunnel, 2)
+    until = time.monotonic() + 18
+    while time.monotonic() < until:
+        value = json.loads(record.read_text())
+        if "recovered" in value:
+            if not value["recovered"] or network_identity(before) != network_identity(recovery_baseline()):
+                raise RuntimeError("Recovery test failed or network baseline changed")
+            save(LOCAL / "recovery-tested.json", {"tunnel": tunnel, "time": time.time()})
+            print("Launchd recovery stopped the inactive tunnel and preserved the network baseline.")
+            return
+        time.sleep(0.25)
+    raise RuntimeError("Independent recovery did not finish; no tunnel was started")
+
+
+def trial(name, seconds):
+    tunnel = resolve_tunnel(name)
+    attestation = json.loads((LOCAL / "recovery-tested.json").read_text())
+    if attestation["tunnel"] != tunnel or not 0 <= time.time() - attestation["time"] < 86400:
+        raise RuntimeError("Run recovery-test for this tunnel before its first controlled activation")
+    if tunnel_status(tunnel) != "Disconnected":
+        raise RuntimeError("RackNerd tunnel must initially be inactive")
+    state = snapshot()
+    if re.search(r"^(default|0/1|0\.0\.0\.0/1|128\.0/1|128\.0\.0\.0/1).*\butun\d+\b",
+                 state["ipv4_routes"]["stdout"], re.M):
+        raise RuntimeError("Another VPN has Internet routes; disconnect it before this trial")
+    before = recovery_baseline()
+    if any(name.lower() in ("http_proxy", "https_proxy", "all_proxy")
+           for name in state["proxy_environment_names"]) or re.search(
+            r"(?:HTTP|HTTPS|SOCKS|ProxyAutoConfig|ProxyAutoDiscovery)Enable\s*:\s*1\b", before["proxies"]):
+        raise RuntimeError("An application or system proxy is enabled; preserve its settings and disable it for the trial")
+    probe = resolve_tunnel("RackNerd-Mac-Probe")
+    is_probe = tunnel == probe
+    receipt = LOCAL / "probe-restored.json"
+    if not is_probe:
+        if tunnel_status(probe) != "Disconnected":
+            raise RuntimeError("Disconnect the Probe tunnel before testing the full profile")
+        restored = json.loads(receipt.read_text()) if receipt.exists() else {}
+        if not (restored.get("tunnel") == probe and restored.get("endpoint") == ENDPOINT and
+                network_identity(restored.get("network", {})) == network_identity(before)
+                and 0 <= time.time() - restored.get("time", 0) < 86400):
+            raise RuntimeError("Complete a timed active Probe trial and restore this network before full-tunnel testing")
+    baseline = verify(expect=None)
+    if not (baseline["public_exit_checks_passed"] and baseline["native_dns"]["ok"] and
+            baseline["python"]["ok"] and all(r["ok"] for r in baseline["https"].values())):
+        raise RuntimeError("Ordinary HTTPS connectivity is unavailable before the trial")
+    save(LOCAL / "trial-baseline.json", {"network": before, "connectivity": baseline})
+    if is_probe:
+        receipt.unlink(missing_ok=True)
+    record = arm_recovery(tunnel, seconds, before if is_probe else None)
+    try:
+        checked(SCUTIL, "--nc", "start", tunnel)
+        until = time.monotonic() + 12
+        while time.monotonic() < until and tunnel_status(tunnel) != "Connected":
+            time.sleep(0.25)
+        if tunnel_status(tunnel) != "Connected":
+            raise RuntimeError("WireGuard did not reach Connected during the controlled trial")
+        endpoint_route = route_identity(run("/sbin/route", "-n", "get", ENDPOINT))
+        if is_probe:
+            if any(endpoint_route.get(key) != before["routes"][ENDPOINT].get(key)
+                   for key in ("interface", "gateway")):
+                raise RuntimeError("Probe changed the ordinary endpoint path")
+        else:
+            gateway = json.loads((LOCAL / "enrollment.json").read_text())["gateway"]
+            inner = route_identity(run("/sbin/route", "-n", "get", gateway))
+            if not re.fullmatch(r"utun[0-9]+", inner["interface"]):
+                raise RuntimeError("VPS tunnel address is outside the tunnel")
+            check_endpoint_path(ENDPOINT, before["routes"][ENDPOINT], endpoint_route, inner["interface"])
+            if not run("/sbin/ping", "-n", "-c", "3", "-W", "1000", gateway)["ok"]:
+                raise RuntimeError("VPS tunnel address did not respond")
+    except RuntimeError:
+        stop_tunnel(tunnel)
+        raise
+    print(f"Trial started. Independent recovery is armed for {seconds}s. Record: {record}")
+
+
+def https(url, ipv4=True, connect_timeout=4):
+    total_timeout = connect_timeout + 6
+    return run("/usr/bin/curl", "--disable", "--noproxy", "*", "-4" if ipv4 else "-6",
+               "--fail", "--silent", "--show-error", "--connect-timeout", str(connect_timeout),
+               "--max-time", str(total_timeout),
+               "--write-out", "\nRN_METRICS %{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}\n",
+               url, timeout=total_timeout + 2)
+
+
+def check_site(url, *, exit_lookup=False):
+    attempts = []
+    for seconds in (4, 10):
+        result = https(url, connect_timeout=seconds)
+        # Keep curl timings and errors without retaining page bodies.
+        lines = result["stdout"].splitlines()
+        result["stdout"] = "\n".join(line for line in lines if line.startswith("RN_METRICS "))
+        if exit_lookup and result["ok"] and lines:
+            try:
+                result["ipv4"] = str(ipaddress.IPv4Address(lines[0]))
+                result["stdout"] = result["ipv4"] + "\n" + result["stdout"]
+            except ValueError:
+                pass
+        attempts.append(result)
+        if result.get("exit_code") != 28 and not (exit_lookup and result.get("exit_code") == 7):
+            break
+    return dict(result, attempts=attempts)
+
+
+def public_exits(expect):
+    primary = ("https://api.ipify.org", "https://ipv4.icanhazip.com")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = {url: pool.submit(check_site, url, exit_lookup=True) for url in primary}
+        exits = {url: task.result() for url, task in pending.items()}
+    # One unavailable provider can be replaced by an independent witness.
+    # A conflicting IP, malformed response or certificate error remains a failure.
+    if (sum("ipv4" in r for r in exits.values()) == 1
+            and any(r.get("exit_code") in (7, 28) for r in exits.values())
+            and all(expect is None or r["ipv4"] == expect for r in exits.values() if "ipv4" in r)):
+        backup = "https://checkip.amazonaws.com"
+        exits[backup] = check_site(backup, exit_lookup=True)
+    observed = {url: r["ipv4"] for url, r in exits.items() if "ipv4" in r}
+    passed = len(observed) >= 2 and (expect is None or all(ip == expect for ip in observed.values()))
+    return exits, observed, passed
+
+
+def verify(expect="configured"):
+    if expect == "configured":
+        expect = ENDPOINT
+    exits, observed, exits_passed = public_exits(expect)
+    try:
+        socket.getaddrinfo("www.python.org", 443, type=socket.SOCK_STREAM)
+        native_dns = {"ok": True}
+    except OSError as error:
+        native_dns = {"ok": False, "error": str(error)}
+    urls = ("https://example.com", "https://www.python.org/robots.txt", "https://pypi.org/robots.txt")
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        sites = dict(zip(urls, pool.map(check_site, urls)))
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open("https://pypi.org/robots.txt", timeout=8) as response:
+            python_result = {"ok": response.status == 200, "http_status": response.status,
+                             "bytes_read": len(response.read(1024))}
+    except Exception as error:
+        python_result = {"ok": False, "error": str(error)}
+    ipv6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    ipv6.settimeout(4)
+    try:
+        ipv6.connect(("2606:4700:4700::1111", 443))
+        ipv6_result = {"reachable": True, "source": ipv6.getsockname()[0]}
+    except OSError as error:
+        ipv6_result = {"reachable": False, "error": str(error)}
+    finally:
+        ipv6.close()
+    return {"expected_ipv4": expect, "observed_ipv4": observed, "exit_requests": exits,
+            "public_exit_checks_passed": exits_passed,
+            "native_dns": native_dns, "https": sites, "python": python_result,
+            "ipv6_numeric_tcp_probe": ipv6_result,
+            "browsers_chatgpt_codex": "Requires actual application verification",
+            "dns_path_and_other_ipv6_destinations": "Requires route review and packet capture"}
+
+
+def main():
+    global ENDPOINT
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest="command", required=True)
+    p = subs.add_parser("configure", help="Save this VPS public endpoint in ignored local settings")
+    p.add_argument("--endpoint", required=True)
+    for name in ("snapshot", "status", "keygen", "verify", "measure"):
+        subs.add_parser(name)
+    p = subs.add_parser("profile")
+    p.add_argument("--inventory", required=True)
+    p.add_argument("--interface", required=True)
+    p.add_argument("--address", required=True)
+    for name in ("recovery-test", "trial", "disconnect"):
+        p = subs.add_parser(name)
+        p.add_argument("tunnel")
+        if name == "trial":
+            p.add_argument("--seconds", type=int, default=90, choices=range(30, 301), metavar="30..300")
+    p = subs.add_parser("_recover", help=argparse.SUPPRESS)
+    p.add_argument("record", type=Path)
+    args = parser.parse_args()
+    if sys.platform != "darwin":
+        parser.error("Use this client helper on macOS")
+    os.umask(0o077)
+    private_dir(LOCAL)
+    if args.command == "configure":
+        address = ipaddress.IPv4Address(args.endpoint)
+        if not address.is_global:
+            raise ValueError("Expected the VPS public IPv4 address")
+        path = LOCAL / "settings.json"
+        if path.exists() and json.loads(path.read_text())["endpoint"] != str(address):
+            raise RuntimeError("Existing settings belong to a different VPS")
+        save(path, {"endpoint": str(address), "port": 51820})
+        print("Local VPS endpoint saved. No network settings changed.")
+        return
+    if args.command not in ("keygen", "_recover"):
+        ENDPOINT = str(ipaddress.IPv4Address(json.loads((LOCAL / "settings.json").read_text())["endpoint"]))
+    if args.command == "keygen":
+        keygen()
+    elif args.command == "profile":
+        profile(args)
+    elif args.command == "snapshot":
+        path = LOCAL / ("snapshot-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".json")
+        save(path, snapshot())
+        print(path)
+    elif args.command == "status":
+        print(json.dumps(snapshot(), indent=2))
+    elif args.command == "verify":
+        value = verify()
+        save(LOCAL / "verification.json", value)
+        print(json.dumps(value, indent=2))
+        if not (value["public_exit_checks_passed"] and value["native_dns"]["ok"] and
+                value["python"]["ok"] and all(r["ok"] for r in value["https"].values()) and
+                not value["ipv6_numeric_tcp_probe"]["reachable"]):
+            sys.exit(1)
+    elif args.command == "measure":
+        enrollment = json.loads((LOCAL / "enrollment.json").read_text())
+        value = {"ping": {address: run("/sbin/ping", "-n", "-c", "5", "-W", "1000", address)
+                           for address in (ENDPOINT, enrollment["gateway"])},
+                 "dns": run("/usr/bin/dig", "+tries=1", "+time=3", "@1.1.1.1", "example.com"),
+                 "https": verify(), "path": snapshot()["routes_to"],
+                 "throughput": "Not measured"}
+        save(LOCAL / "performance.json", value)
+        print(json.dumps(value, indent=2))
+    elif args.command == "recovery-test":
+        recovery_test(args.tunnel)
+    elif args.command == "trial":
+        trial(args.tunnel, args.seconds)
+    elif args.command == "disconnect":
+        stop_tunnel(resolve_tunnel(args.tunnel))
+        baseline = LOCAL / "trial-baseline.json"
+        if baseline.exists() and network_identity(json.loads(baseline.read_text())["network"]) != network_identity(recovery_baseline()):
+            raise RuntimeError("Tunnel stopped; current routes/DNS/proxies differ from the saved baseline")
+        print("RackNerd disconnected. Network settings were left to macOS NetworkExtension.")
+    else:
+        recover(args.record)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, KeyError) as error:
+        sys.exit("rn-mac: " + str(error))

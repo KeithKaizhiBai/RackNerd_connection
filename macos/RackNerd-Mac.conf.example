@@ -1,0 +1,13 @@
+# Illustration only. Generate an importable file after live VPS inspection.
+# Replace all uppercase placeholders on the Mac; keep the private file out of Git.
+[Interface]
+PrivateKey = MAC_PRIVATE_KEY
+Address = CONFIRMED_MAC_IPV4/32, MAC_IPV6_SINK/128
+DNS = 1.1.1.1, 9.9.9.9
+MTU = 1380
+
+[Peer]
+PublicKey = LIVE_SERVER_PUBLIC_KEY
+Endpoint = VPS_PUBLIC_IPV4:51820
+AllowedIPs = 0.0.0.0/0, ::/1, 8000::/1
+PersistentKeepalive = 25

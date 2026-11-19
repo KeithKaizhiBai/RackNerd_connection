@@ -1,0 +1,18 @@
+[Unit]
+Description=MacBook Internet gateway on a dedicated WireGuard interface
+Requisite=racknerd-gateway.service wg-quick@wg0.service
+After=racknerd-gateway.service wg-quick@wg0.service racknerd-web-proxy.service
+PartOf=racknerd-gateway.service wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+RuntimeDirectory=racknerd-mac-independent
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/python3 -B /usr/local/lib/racknerd-mac-independent/interface.py up
+ExecStopPost=/usr/bin/python3 -B /usr/local/lib/racknerd-mac-independent/interface.py down
+
+[Install]
+WantedBy=multi-user.target

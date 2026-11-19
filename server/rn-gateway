@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""WireGuard IPv4 gateway for a fresh, dedicated Ubuntu 24.04 VPS."""
+"""WireGuard IPv4 gateway and independent peers on a dedicated Ubuntu 24.04 VPS."""
 
 import argparse
 import base64
@@ -26,6 +26,7 @@ UNIT = Path("/etc/systemd/system") / SERVICE
 DATA, RUNTIME = Path("/var/lib/rn-public-gateway"), Path("/run/rn-public-gateway")
 KEY, SETTINGS, ACTIVE = DATA / "server.key", DATA / "settings.json", DATA / "active.json"
 TRIAL, APPLIED = RUNTIME / "trial.json", RUNTIME / "applied.json"
+PEERS, PEER_TRIAL = DATA / "peers.json", RUNTIME / "peer-trial.json"
 IPV4_CONF = Path("/proc/sys/net/ipv4/conf")
 TRIAL_SECONDS = 600
 UNIT_TEXT = f"""[Unit]
@@ -224,12 +225,12 @@ def preflight(port):
     return topology()
 
 
-def nft_rules(net, token):
+def nft_rules(net, token, peers=None):
     wan = net["wan"]
     excluded = ", ".join(net["excluded"])
     # Creation is exclusive and the whole batch is a single nftables transaction.
     prefix = f"ip {TABLE}"
-    return f"""create table {prefix}
+    rules = f"""create table {prefix}
 add chain {prefix} owned_{token}
 add set {prefix} non_internet {{ type ipv4_addr; flags interval; }}
 add element {prefix} non_internet {{ {excluded} }}
@@ -246,6 +247,63 @@ add rule {prefix} forward oifname "{IFACE}" counter drop
 add chain {prefix} wan_masquerade {{ type nat hook postrouting priority srcnat; policy accept; }}
 add rule {prefix} wan_masquerade iifname "{IFACE}" oifname "{wan}" ip saddr {CLIENT} ip daddr != @non_internet counter masquerade
 """
+    for name, peer in (peers or {}).items():
+        rules += extra_nft_rules(net, name, peer)
+    return rules
+
+
+def extra_peer(name, peer):
+    """Validate one additional identity without changing the Windows identity."""
+    require(re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name) and name != "windows",
+            "Use a peer name of 1-31 lowercase letters, digits or hyphens; windows is reserved.")
+    require(isinstance(peer, dict) and set(peer) == {"peer", "address"}, "Invalid additional peer record.")
+    public_key(peer["peer"])
+    address = ipaddress.IPv4Address(peer["address"])
+    subnet = ipaddress.IPv4Network(SERVER + "/24", strict=False)
+    require(str(address) == peer["address"] and address in subnet and
+            str(address) not in (SERVER, CLIENT, str(subnet.network_address), str(subnet.broadcast_address)),
+            "Additional peer address must be an unused host in the published gateway /24.")
+    return peer
+
+
+def additional_peers(cfg, include_trial=True):
+    peers = read(PEERS) if PEERS.exists() else {}
+    require(isinstance(peers, dict), "Invalid peers.json.")
+    peers = dict(peers)
+    if include_trial and PEER_TRIAL.exists():
+        pending = read(PEER_TRIAL)
+        require(pending["name"] not in peers or peers[pending["name"]] == pending["record"],
+                "Pending and committed peer records conflict.")
+        peers[pending["name"]] = pending["record"]
+    keys, addresses = {cfg["peer"]}, {SERVER, CLIENT}
+    for name, peer in peers.items():
+        extra_peer(name, peer)
+        require(peer["peer"] not in keys and peer["address"] not in addresses,
+                "Duplicate peer key or tunnel address.")
+        keys.add(peer["peer"])
+        addresses.add(peer["address"])
+    return peers
+
+
+def extra_nft_rules(net, name, peer):
+    extra_peer(name, peer)
+    wan, address, tag = net["wan"], peer["address"], "rn-peer:" + name
+    prefix = f"ip {TABLE}"
+    # Each inserted accept is scoped to this /32. Private destinations and
+    # peer-to-peer packets still reach the original drop rules.
+    return f'''insert rule {prefix} input iifname "{IFACE}" ip saddr {address} ip daddr {SERVER} icmp type echo-request counter accept comment "{tag}"
+insert rule {prefix} forward iifname "{IFACE}" oifname "{wan}" ip saddr {address} ip daddr != @non_internet ct state {{ new, established, related }} counter accept comment "{tag}"
+insert rule {prefix} forward iifname "{wan}" oifname "{IFACE}" ip daddr {address} ct state {{ established, related }} counter accept comment "{tag}"
+insert rule {prefix} wan_masquerade iifname "{IFACE}" oifname "{wan}" ip saddr {address} ip daddr != @non_internet counter masquerade comment "{tag}"
+'''
+
+
+def extra_rule_handles(name):
+    entries = jrun("nft", "-j", "-a", "list", "table", "ip", TABLE)["nftables"]
+    return [(r["chain"], r["handle"]) for entry in entries if (r := entry.get("rule"))
+            and r.get("family") == "ip" and r.get("table") == TABLE
+            and r.get("chain") in ("input", "forward", "wan_masquerade")
+            and r.get("comment") == "rn-peer:" + name]
 
 
 def link_details():
@@ -288,9 +346,10 @@ def up():
     if not ACTIVE.exists():
         require(time.monotonic() < cfg["deadline"], "Trial expired before activation.")
     require(not APPLIED.exists(), "Previous activation still needs rollback.")
+    peers = additional_peers(cfg)
     net = preflight(cfg["port"])
     token = cfg["token"]
-    rules = nft_rules(net, token)
+    rules = nft_rules(net, token, peers)
     run("nft", "--check", "-f", "-", data=rules)
     state = {"token": token, "wan": net["wan"], "index": net["index"], "wan_touched": False}
     save(APPLIED, state)
@@ -298,11 +357,15 @@ def up():
     run("ip", "link", "add", "name", IFACE, "alias", "rn-public-gateway:" + token, "type", "wireguard")
     run("wg", "set", IFACE, "private-key", str(KEY), "listen-port", str(cfg["port"]),
         "peer", cfg["peer"], "allowed-ips", CLIENT + "/32")
+    for peer in peers.values():
+        run("wg", "set", IFACE, "peer", peer["peer"], "allowed-ips", peer["address"] + "/32")
     run("ip", "-4", "address", "add", SERVER + "/32", "dev", IFACE)
     wan_mtu = int(link_details()[net["wan"]]["mtu"])
     require(wan_mtu >= 1360, "Uplink MTU too small for this profile.")
     run("ip", "link", "set", "dev", IFACE, "mtu", str(min(1420, wan_mtu - 80)), "up")
     run("ip", "-4", "route", "add", CLIENT + "/32", "dev", IFACE)
+    for peer in peers.values():
+        run("ip", "-4", "route", "add", peer["address"] + "/32", "dev", IFACE)
     forwarding(IFACE, 1)
     state["wan_touched"] = True
     save(APPLIED, state)
@@ -414,12 +477,144 @@ def verify_live(cfg):
     require(link_details().get(IFACE, {}).get("ifalias") == "rn-public-gateway:" + cfg["token"]
             and all((IPV4_CONF / i / "forwarding").read_text().strip() == "1" for i in (state["wan"], IFACE)),
             "Gateway interface or forwarding changed.")
+    peers = additional_peers(cfg)
+    expected = {cfg["peer"]: CLIENT + "/32"}
+    expected.update({peer["peer"]: peer["address"] + "/32" for peer in peers.values()})
+    actual = {}
+    for line in run("wg", "show", IFACE, "allowed-ips").splitlines():
+        fields = line.split()
+        require(len(fields) == 2 and fields[0] not in actual, "Unexpected WireGuard AllowedIPs record.")
+        actual[fields[0]] = fields[1]
     require(run("wg", "show", IFACE, "listen-port") == str(cfg["port"])
-            and run("wg", "show", IFACE, "public-key") == server_public()
-            and run("wg", "show", IFACE, "allowed-ips").split() == [cfg["peer"], CLIENT + "/32"],
+            and run("wg", "show", IFACE, "public-key") == server_public() and actual == expected,
             "WireGuard key, peer, allowed source or listen port changed.")
     peer_route = jrun("ip", "-j", "-4", "route", "get", CLIENT)
     require(peer_route and peer_route[0].get("dev") == IFACE, "The route to the Windows peer changed.")
+    for name, peer in peers.items():
+        route = jrun("ip", "-j", "-4", "route", "get", peer["address"])
+        handles = extra_rule_handles(name)
+        require(route and route[0].get("dev") == IFACE and
+                sorted(chain for chain, _ in handles) == ["forward", "forward", "input", "wan_masquerade"],
+                "Additional peer route or scoped firewall rules changed: " + name)
+
+
+def peer_timer(token):
+    return "rn-public-peer-" + token
+
+
+def remove_live_peer(name, peer):
+    """Remove only this peer, its exact host route and its four tagged rules."""
+    extra_peer(name, peer)
+    state = read(APPLIED) if APPLIED.exists() else None
+    links = link_details()
+    if IFACE in links:
+        require(state and links[IFACE].get("ifalias") == "rn-public-gateway:" + state["token"],
+                "Gateway interface ownership changed; no peer removed.")
+    routes = jrun("ip", "-j", "-4", "route", "show", "table", "main", "exact", peer["address"] + "/32")
+    require(all(r.get("dev") == IFACE and not r.get("gateway") for r in routes),
+            "Peer host route is now owned by another path; retained.")
+    allowed = {}
+    if IFACE in links:
+        allowed = dict(line.split(None, 1) for line in run("wg", "show", IFACE, "allowed-ips").splitlines())
+        require(peer["peer"] not in allowed or allowed[peer["peer"]].strip() == peer["address"] + "/32",
+                "Peer identity changed; retained.")
+    if state and owned_table(state["token"]):
+        handles = extra_rule_handles(name)
+        if handles:
+            rules = "".join(f"delete rule ip {TABLE} {chain} handle {handle}\n"
+                            for chain, handle in handles)
+            run("nft", "-f", "-", data=rules)
+    if routes:
+        run("ip", "-4", "route", "del", peer["address"] + "/32", "dev", IFACE)
+    if peer["peer"] in allowed:
+        run("wg", "set", IFACE, "peer", peer["peer"], "remove")
+
+
+def cancel_peer_trial(stop_timer=True):
+    if not PEER_TRIAL.exists():
+        print("No additional peer trial is pending.")
+        return
+    pending = read(PEER_TRIAL)
+    committed = read(PEERS) if PEERS.exists() else {}
+    # A commit is durable before the transient marker is removed.
+    if committed.get(pending["name"]) != pending["record"]:
+        remove_live_peer(pending["name"], pending["record"])
+    PEER_TRIAL.unlink()
+    if stop_timer and systemd_property(peer_timer(pending["token"]) + ".timer", "ActiveState") == "active":
+        run("systemctl", "stop", peer_timer(pending["token"]) + ".timer")
+    print("Additional peer trial cleared; Windows and server identities retained.")
+
+
+def add_peer(name, key, address, seconds):
+    ensure_installed()
+    require(ACTIVE.exists() and not TRIAL.exists(), "Use a committed rn-public gateway for additional peers.")
+    require(not PEER_TRIAL.exists(), "Commit or cancel the pending peer trial first.")
+    cfg = read(ACTIVE)
+    verify_live(cfg)
+    record = extra_peer(name, {"peer": key, "address": address})
+    peers = additional_peers(cfg, include_trial=False)
+    require(name not in peers and key not in {cfg["peer"], server_public()} |
+            {p["peer"] for p in peers.values()} and address not in {p["address"] for p in peers.values()},
+            "Peer name, key or address is already assigned.")
+    for route in jrun("ip", "-j", "-4", "route", "show", "table", "all"):
+        dst = route.get("dst", "default")
+        if dst != "default":
+            require(ipaddress.IPv4Address(address) not in ipaddress.IPv4Network(dst, strict=False),
+                    "Candidate address overlaps an existing VPS route.")
+    rules = extra_nft_rules(read(APPLIED), name, record)
+    require(not extra_rule_handles(name), "Tagged peer rules already exist.")
+    run("nft", "--check", "-f", "-", data=rules)
+    token = secrets.token_hex(12)
+    save(PEER_TRIAL, {"name": name, "record": record, "token": token,
+                      "deadline": time.monotonic() + seconds})
+    try:
+        run("systemd-run", "--unit=" + peer_timer(token), f"--on-active={seconds}s",
+            "--timer-property=AccuracySec=1s", "--property=Restart=on-failure",
+            "--property=RestartSec=10s", "--property=StartLimitBurst=3",
+            "--property=StartLimitIntervalSec=120s", str(PROGRAM), "_peer-auto", token)
+        require(systemd_property(peer_timer(token) + ".timer", "ActiveState") == "active",
+                "Additional peer rollback timer failed to arm.")
+        # These operations neither replace the full peer list nor restart the interface.
+        run("nft", "-f", "-", data=rules)
+        run("ip", "-4", "route", "add", address + "/32", "dev", IFACE)
+        run("wg", "set", IFACE, "peer", key, "allowed-ips", address + "/32")
+        require(time.monotonic() < read(PEER_TRIAL)["deadline"], "Peer trial expired during startup.")
+        verify_live(cfg)
+    except BaseException:
+        cancel_peer_trial()
+        raise
+    print(f"Peer {name} staged for {seconds}s. Verify both clients' exit and applications, then peer-commit.")
+
+
+def commit_peer():
+    require(ACTIVE.exists() and PEER_TRIAL.exists(), "No additional peer trial is pending.")
+    pending = read(PEER_TRIAL)
+    require(time.monotonic() < pending["deadline"], "Peer trial expired; allow its targeted rollback.")
+    require(systemd_property(peer_timer(pending["token"]) + ".timer", "ActiveState") == "active",
+            "Additional peer rollback timer is inactive.")
+    verify_live(read(ACTIVE))
+    handshakes = dict(line.split() for line in run("wg", "show", IFACE, "latest-handshakes").splitlines())
+    age = time.time() - int(handshakes.get(pending["record"]["peer"], "0"))
+    require(0 <= age <= 180, "Verify a recent additional peer handshake before committing.")
+    peers = additional_peers(read(ACTIVE))
+    require(time.monotonic() < pending["deadline"], "Peer trial expired during verification.")
+    save(PEERS, peers)
+    PEER_TRIAL.unlink()
+    run("systemctl", "stop", peer_timer(pending["token"]) + ".timer")
+    print("Additional peer saved for gateway startup. Reboot survival still needs an approved reboot test.")
+
+
+def remove_peer(name):
+    require(ACTIVE.exists() and not PEER_TRIAL.exists(), "Cancel any additional peer trial first.")
+    cfg = read(ACTIVE)
+    verify_live(cfg)
+    peers = additional_peers(cfg, include_trial=False)
+    require(name in peers, "Unknown additional peer; Windows is retained.")
+    remove_live_peer(name, peers[name])
+    del peers[name]
+    save(PEERS, peers)
+    verify_live(cfg)
+    print("Additional peer removed from live and persistent state; Windows retained.")
 
 
 def commit():
@@ -451,6 +646,9 @@ def rollback():
         print("No active configuration to roll back.")
         return
     check_unit()
+    if PEER_TRIAL.exists():
+        with lock("service.lock"):
+            cancel_peer_trial()
     trial = read(TRIAL) if TRIAL.exists() else None
     run("systemctl", "disable", SERVICE)
     ACTIVE.unlink(missing_ok=True)
@@ -478,6 +676,10 @@ def status():
         print(f"Trial. Remaining seconds: {max(0, int(cfg['deadline'] - time.monotonic()))}")
     verify_live(cfg)
     print(f"{IFACE}  server={SERVER}/32  client={CLIENT}/32  UDP={cfg['port']}")
+    for name, peer in additional_peers(cfg).items():
+        print(f"Additional peer: {name}  address={peer['address']}/32")
+    if PEER_TRIAL.exists():
+        print(f"Additional peer trial: {max(0, int(read(PEER_TRIAL)['deadline'] - time.monotonic()))}s remaining")
     print("Peer and latest handshake (Unix timestamp; 0 means none):")
     print(run("wg", "show", IFACE, "latest-handshakes"))
     print("Peer, received bytes, transmitted bytes:")
@@ -492,10 +694,18 @@ def main():
     subs.add_parser("stage").add_argument("windows_public_key")
     for name in ("public-key", "status", "commit", "rollback"):
         subs.add_parser(name)
+    peer_parser = subs.add_parser("peer-add", help="Stage an independent peer on an existing rn-public gateway")
+    peer_parser.add_argument("name")
+    peer_parser.add_argument("public_key")
+    peer_parser.add_argument("address", help="Confirmed unused IPv4 address, without a prefix")
+    peer_parser.add_argument("--seconds", type=int, default=300, choices=range(60, 601), metavar="60..600")
+    for name in ("peer-commit", "peer-cancel"):
+        subs.add_parser(name)
+    subs.add_parser("peer-remove").add_argument("name")
     # Private entry points for the system service and independently scheduled timer.
-    if len(sys.argv) > 1 and sys.argv[1] in ("_up", "_down", "_auto"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("_up", "_down", "_auto", "_peer-auto"):
         internal = subs.add_parser(sys.argv[1])
-        if sys.argv[1] == "_auto":
+        if sys.argv[1] in ("_auto", "_peer-auto"):
             internal.add_argument("token")
     a = parser.parse_args()
     os.environ.update(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL="C")
@@ -513,6 +723,11 @@ def main():
     if a.command in ("_up", "_down"):
         with lock("service.lock"):
             up() if a.command == "_up" else down()
+        return
+    if a.command == "_peer-auto":
+        with lock("decision.lock"), lock("service.lock"):
+            if PEER_TRIAL.exists() and read(PEER_TRIAL)["token"] == a.token:
+                cancel_peer_trial(stop_timer=False)
         return
     if a.command == "_auto":
         # A lost or suspended staging SSH shell may still own control.lock.
@@ -536,6 +751,17 @@ def main():
         elif a.command == "rollback":
             with lock("decision.lock"):
                 rollback()
+        elif a.command in ("peer-add", "peer-commit", "peer-cancel", "peer-remove"):
+            ensure_installed()
+            with lock("decision.lock"), lock("service.lock"):
+                if a.command == "peer-add":
+                    add_peer(a.name, a.public_key, a.address, a.seconds)
+                elif a.command == "peer-commit":
+                    commit_peer()
+                elif a.command == "peer-cancel":
+                    cancel_peer_trial()
+                else:
+                    remove_peer(a.name)
 
 
 if __name__ == "__main__":

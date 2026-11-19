@@ -1,0 +1,537 @@
+{
+  "schema": "racknerd-live-inventory/1",
+  "wireguard_interfaces": {
+    "ok": true,
+    "value": "wg0"
+  },
+  "wireguard": {
+    "wg0": {
+      "allowed-ips": {
+        "ok": true,
+        "value": "V1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1c=\t10.77.0.2/32\nUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFA=\t10.77.0.3/32"
+      },
+      "peers": {
+        "ok": true,
+        "value": "V1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1c=\nUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFA="
+      },
+      "public-key": {
+        "ok": true,
+        "value": "U1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1M="
+      },
+      "fwmark": {
+        "ok": true,
+        "value": "off"
+      },
+      "listen-port": {
+        "ok": true,
+        "value": "51820"
+      },
+      "persistent-keepalive": {
+        "ok": true,
+        "value": "V1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1c=\toff\nUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFA=\toff"
+      }
+    }
+  },
+  "ipv4_routes": {
+    "ok": true,
+    "value": [
+      {
+        "dst": "default",
+        "dev": "eth0",
+        "gateway": "192.0.2.1"
+      },
+      {
+        "dst": "10.77.0.2",
+        "dev": "wg0",
+        "scope": "link",
+        "flags": []
+      },
+      {
+        "dst": "10.77.0.3",
+        "dev": "wg0",
+        "scope": "link",
+        "flags": []
+      }
+    ]
+  },
+  "ipv4_addresses": {
+    "ok": true,
+    "value": [
+      {
+        "ifname": "wg0",
+        "addr_info": [
+          {
+            "local": "10.77.0.1",
+            "prefixlen": 32
+          }
+        ]
+      },
+      {
+        "ifname": "eth0",
+        "addr_info": [
+          {
+            "local": "192.0.2.5",
+            "prefixlen": 26
+          }
+        ]
+      }
+    ]
+  },
+  "ipv4_policy_rules": {
+    "ok": true,
+    "value": []
+  },
+  "forwarding": {},
+  "global_sysctls": {
+    "/proc/sys/net/ipv4/ip_forward": "1"
+  },
+  "firewall": {
+    "nftables": {
+      "ok": true,
+      "value": {
+        "nftables": [
+          {
+            "metainfo": {
+              "version": "1.0.9",
+              "release_name": "Old Doc Yak #3",
+              "json_schema_version": 1
+            }
+          },
+          {
+            "table": {
+              "family": "ip",
+              "name": "rn_gateway",
+              "handle": 10
+            }
+          },
+          {
+            "counter": {
+              "family": "ip",
+              "name": "outbound",
+              "table": "rn_gateway",
+              "handle": 3,
+              "packets": 2,
+              "bytes": 50
+            }
+          },
+          {
+            "counter": {
+              "family": "ip",
+              "name": "inbound",
+              "table": "rn_gateway",
+              "handle": 4,
+              "packets": 2,
+              "bytes": 50
+            }
+          },
+          {
+            "counter": {
+              "family": "ip",
+              "name": "translated",
+              "table": "rn_gateway",
+              "handle": 5,
+              "packets": 2,
+              "bytes": 50
+            }
+          },
+          {
+            "chain": {
+              "family": "ip",
+              "table": "rn_gateway",
+              "name": "authorized_forward",
+              "handle": 1,
+              "type": "filter",
+              "hook": "forward",
+              "prio": 0,
+              "policy": "drop"
+            }
+          },
+          {
+            "chain": {
+              "family": "ip",
+              "table": "rn_gateway",
+              "name": "egress_nat",
+              "handle": 2,
+              "type": "nat",
+              "hook": "postrouting",
+              "prio": 100,
+              "policy": "accept"
+            }
+          },
+          {
+            "rule": {
+              "family": "ip",
+              "table": "rn_gateway",
+              "chain": "authorized_forward",
+              "handle": 7,
+              "expr": [
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "iifname"
+                      }
+                    },
+                    "right": "wg0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "oifname"
+                      }
+                    },
+                    "right": "eth0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "saddr"
+                      }
+                    },
+                    "right": "10.77.0.3"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "daddr"
+                      }
+                    },
+                    "right": {
+                      "set": [
+                        {
+                          "prefix": {
+                            "addr": "0.0.0.0",
+                            "len": 8
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "10.0.0.0",
+                            "len": 8
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "100.64.0.0",
+                            "len": 10
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "192.0.2.0",
+                            "len": 26
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "127.0.0.0",
+                            "len": 8
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "169.254.0.0",
+                            "len": 16
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "172.16.0.0",
+                            "len": 12
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "192.168.0.0",
+                            "len": 16
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "198.18.0.0",
+                            "len": 15
+                          }
+                        },
+                        {
+                          "prefix": {
+                            "addr": "224.0.0.0",
+                            "len": 3
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "drop": null
+                }
+              ]
+            }
+          },
+          {
+            "rule": {
+              "family": "ip",
+              "table": "rn_gateway",
+              "chain": "authorized_forward",
+              "handle": 9,
+              "expr": [
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "iifname"
+                      }
+                    },
+                    "right": "wg0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "oifname"
+                      }
+                    },
+                    "right": "eth0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "saddr"
+                      }
+                    },
+                    "right": "10.77.0.3"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "ct": {
+                        "key": "state"
+                      }
+                    },
+                    "right": {
+                      "set": [
+                        "established",
+                        "related",
+                        "new"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "counter": "outbound"
+                },
+                {
+                  "accept": null
+                }
+              ]
+            }
+          },
+          {
+            "rule": {
+              "family": "ip",
+              "table": "rn_gateway",
+              "chain": "authorized_forward",
+              "handle": 11,
+              "expr": [
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "iifname"
+                      }
+                    },
+                    "right": "eth0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "oifname"
+                      }
+                    },
+                    "right": "wg0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "daddr"
+                      }
+                    },
+                    "right": "10.77.0.3"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "ct": {
+                        "key": "state"
+                      }
+                    },
+                    "right": {
+                      "set": [
+                        "established",
+                        "related"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "counter": "inbound"
+                },
+                {
+                  "accept": null
+                }
+              ]
+            }
+          },
+          {
+            "rule": {
+              "family": "ip",
+              "table": "rn_gateway",
+              "chain": "egress_nat",
+              "handle": 12,
+              "expr": [
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "iifname"
+                      }
+                    },
+                    "right": "wg0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "meta": {
+                        "key": "oifname"
+                      }
+                    },
+                    "right": "eth0"
+                  }
+                },
+                {
+                  "match": {
+                    "op": "==",
+                    "left": {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "saddr"
+                      }
+                    },
+                    "right": "10.77.0.3"
+                  }
+                },
+                {
+                  "counter": "translated"
+                },
+                {
+                  "masquerade": null
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "iptables": {
+      "ok": true,
+      "value": ""
+    },
+    "iptables_legacy": {
+      "ok": true,
+      "value": ""
+    },
+    "ip6tables": {
+      "ok": true,
+      "value": ""
+    },
+    "ufw": {
+      "ok": true,
+      "value": "Status: inactive"
+    }
+  },
+  "persistence": {
+    "services": {
+      "wg-quick@wg0.service": {
+        "ok": true,
+        "value": "LoadState=loaded\nActiveState=active\nSubState=exited\nFragmentPath=/etc/systemd/system/wg-quick@wg0.service\nDropInPaths=\nUnitFileState=enabled"
+      },
+      "racknerd-gateway.service": {
+        "ok": true,
+        "value": "LoadState=loaded\nActiveState=active\nSubState=exited\nFragmentPath=/etc/systemd/system/racknerd-gateway.service\nDropInPaths=\nUnitFileState=enabled"
+      },
+      "racknerd-web-proxy.service": {
+        "ok": true,
+        "value": "LoadState=loaded\nActiveState=active\nSubState=exited\nFragmentPath=/etc/systemd/system/racknerd-web-proxy.service\nDropInPaths=\nUnitFileState=enabled"
+      },
+      "nftables.service": {
+        "ok": true,
+        "value": "LoadState=loaded\nActiveState=inactive\nSubState=exited\nFragmentPath=/etc/systemd/system/nftables.service\nDropInPaths=\nUnitFileState=enabled"
+      }
+    },
+    "wireguard_profiles": {
+      "/etc/wireguard/wg0.conf": {
+        "public_fields": {
+          "sections": [
+            {
+              "section": "Interface",
+              "fields": {
+                "address": [
+                  "10.77.0.1/32"
+                ],
+                "listenport": [
+                  "51820"
+                ]
+              }
+            },
+            {
+              "section": "Peer",
+              "fields": {
+                "publickey": [
+                  "V1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1c="
+                ],
+                "allowedips": [
+                  "10.77.0.2/32"
+                ]
+              }
+            }
+          ],
+          "hook_directives_present": []
+        }
+      }
+    }
+  }
+}

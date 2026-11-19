@@ -1,0 +1,21 @@
+[Unit]
+Description=Additional MacBook peer on the existing WireGuard gateway
+Requisite=racknerd-gateway.service wg-quick@wg0.service
+After=racknerd-gateway.service wg-quick@wg0.service racknerd-web-proxy.service
+PartOf=racknerd-gateway.service wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=racknerd-mac
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/lib/racknerd-mac/wg0-mac.py up
+ExecStopPost=/usr/bin/python3 /usr/local/lib/racknerd-mac/wg0-mac.py down
+# Complete read-only inventories are collected on both sides of each mutation.
+TimeoutStartSec=10min
+TimeoutStopSec=10min
+
+[Install]
+WantedBy=multi-user.target

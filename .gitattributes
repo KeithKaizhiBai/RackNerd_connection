@@ -2,5 +2,9 @@
 *.md  text eol=lf
 *.sh  text eol=lf
 server/rn-gateway text eol=lf
+server/inspect-live.py text eol=lf
+macos/rn-mac text eol=lf
+*.py text eol=lf
+*.conf.example text eol=lf
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
