@@ -76,6 +76,10 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     $devices=@([pscustomobject]@{ifIndex=7;HardwareInterface=$true;Status='Up';Name='fixture-ethernet';InterfaceDescription='Ethernet'},
         [pscustomobject]@{ifIndex=12;HardwareInterface=$false;Status='Up';Name='fixture-tun';InterfaceDescription='virtual tunnel'})
     function Get-NetAdapter {$devices}
+    function Get-NetIPInterface($AddressFamily,$ErrorAction) {
+        [pscustomobject]@{InterfaceIndex=7;ConnectionState='Connected'}
+        [pscustomobject]@{InterfaceIndex=12;ConnectionState='Connected'}
+    }
     function Get-Service($Name,$ErrorAction) {}
     function Get-NetIPAddress($IPAddress,$ErrorAction) {}
     function Get-VpnConnection([switch]$AllUserConnection,$ErrorAction) {}
@@ -84,6 +88,56 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     Rejected {NewState 'Test'} 'half-default'
     $net+= [pscustomobject]@{DestinationPrefix='198.51.100.8/32';NextHop='192.0.2.1';InterfaceIndex=7}
     Rejected {NewState 'Test'} 'specific endpoint'
+}
+& {
+    # Exercise the real preflight using synthetic interfaces and routes. Stop
+    # at endpoint lookup, before state files, keys or networking can be changed.
+    . (Read-TestFunction 'Gateway-Mode.ps1' 'NewState')
+    $current='fixture-state';$endpoint='198.51.100.8';$endpointPrefix=$endpoint+'/32'
+    function Test-Path($LiteralPath) {$false}
+    $net=@(
+        [pscustomobject]@{DestinationPrefix='0.0.0.0/0';NextHop='192.0.2.1';InterfaceIndex=7},
+        [pscustomobject]@{DestinationPrefix='0.0.0.0/0';NextHop='192.0.2.2';InterfaceIndex=8}
+    )
+    $devices=@(
+        [pscustomobject]@{ifIndex=7;HardwareInterface=$true;Status='Up';Name='fixture-ethernet'},
+        [pscustomobject]@{ifIndex=8;HardwareInterface=$true;Status='Disconnected';Name='fixture-wifi'}
+    )
+    $interfaces=@(
+        [pscustomobject]@{InterfaceIndex=7;ConnectionState='Connected'},
+        [pscustomobject]@{InterfaceIndex=8;ConnectionState='Disconnected'}
+    )
+    function Get-NetRoute($AddressFamily,$PolicyStore) {
+        Check ($AddressFamily -ceq 'IPv4' -and $PolicyStore -ceq 'ActiveStore') 'Unexpected route query'
+        $net
+    }
+    function Get-NetAdapter {$devices}
+    function Get-NetIPInterface($AddressFamily,$ErrorAction) {
+        Check ($AddressFamily -ceq 'IPv4' -and $ErrorAction -ceq 'Stop') 'Interface query must fail on errors'
+        $interfaces
+    }
+    function Get-Service($Name,$ErrorAction) {}
+    function Get-NetIPAddress($IPAddress,$ErrorAction) {}
+    function Get-VpnConnection([switch]$AllUserConnection,$ErrorAction) {}
+    function Find-NetRoute($RemoteIPAddress) {
+        Check ($RemoteIPAddress -ceq $endpoint) 'Unexpected endpoint lookup'
+        Check ($phys.Count -eq 1 -and $phys[0].InterfaceIndex -eq 7 -and $phys[0].NextHop -ceq '192.0.2.1') 'Wrong physical gateway selected'
+        throw 'Fixture: expected physical gateway selected'
+    }
+    Rejected {NewState 'Test'} 'Fixture: expected physical gateway selected'
+    $devices[1].Status='Up'
+    Rejected {NewState 'Test'} 'Fixture: expected physical gateway selected'
+    $devices[1].Status='Disconnected';$interfaces[1].ConnectionState='Connected'
+    Rejected {NewState 'Test'} 'Fixture: expected physical gateway selected'
+    $devices[1].Status='Up'
+    Rejected {NewState 'Test'} 'unambiguous physical'
+    $devices[1].HardwareInterface=$false
+    Rejected {NewState 'Test'} 'unambiguous physical'
+    $interfaces[0].ConnectionState='Disconnected'
+    Rejected {NewState 'Test'} 'unambiguous physical'
+    $devices[1].Status='Disconnected';$interfaces[1].ConnectionState='Disconnected'
+    Rejected {NewState 'Test'} 'unambiguous physical'
+    Check ($net.Count -eq 2 -and $net[1].InterfaceIndex -eq 8) 'Preflight changed the retained WLAN route'
 }
 & {
     . (Read-TestFunction 'Gateway-Mode.ps1' 'Test-RnTrialQualifies')
@@ -122,4 +176,4 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     Check ($dns.Count -eq 1 -and $dns.ContainsKey('other') -and $fw.Count -eq 1 -and $fw.ContainsKey('external')) 'Rollback touched a foreign rule'
     Check (($events -join ',') -ceq 'service,cache,proxy') 'Rollback was not idempotent'
 }
-'Offline validation passed: parsing, inputs, profile, scheduled rollback, TUN conflicts, trial qualification and scoped cleanup.'
+'Offline validation passed: parsing, inputs, profile, scheduled rollback, disconnected-interface routes, active-gateway conflicts, TUN conflicts, trial qualification and scoped cleanup.'

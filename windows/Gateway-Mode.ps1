@@ -153,7 +153,14 @@ function NewState($kind){
     }
     $routes=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore)
     $adapters=@(Get-NetAdapter)
-    $gateways=@($routes | Where-Object DestinationPrefix -eq '0.0.0.0/0')
+    # ActiveStore can retain default routes for disconnected adapters.
+    $connectedIPv4=@(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object ConnectionState -eq 'Connected' | ForEach-Object InterfaceIndex)
+    $onlineAdapters=@($adapters | Where-Object Status -eq 'Up' | ForEach-Object ifIndex)
+    $gateways=@($routes | Where-Object {
+        $_.DestinationPrefix -eq '0.0.0.0/0' -and
+        $_.InterfaceIndex -in $connectedIPv4 -and $_.InterfaceIndex -in $onlineAdapters
+    })
     $phys=@($gateways | Where-Object {
         $index=$_.InterfaceIndex
         $_.NextHop -ne '0.0.0.0' -and @($adapters | Where-Object {$_.ifIndex -eq $index -and $_.HardwareInterface -and $_.Status -eq 'Up'}).Count -eq 1

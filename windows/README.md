@@ -52,6 +52,23 @@ Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路�
 
 只想从终端查看状态时，在仓库根目录运行 `.\gui\RackNerd-Network.cmd Status`。面板最小化后可从托盘打开，关闭窗口后隧道继续按所选模式运行。
 
+## 连接前检查修复与验证
+
+2026-11-20 修复了断开 WLAN 后仍保留默认路由时的误报。旧版统计所有默认路由，可能在点击连接后以 `Need one unambiguous physical IPv4 default route` 退出。新版同时检查网卡 `Up` 和 IPv4 接口 `Connected`，从 `ActiveStore` 中选取有效默认路由。断开接口上的残留默认路由会被忽略；它们仍保留在 Windows 中。
+
+实际同时存在两个有效出口、正在运行的其他 VPN/TUN、端点专用路由或其他路由冲突，仍需要先处理。此修复解决网关选择阶段的误判，后续的 DNS、握手和真实出口核验继续执行。故障定位见[验收与恢复](../docs/verify-and-recover.md)。
+
+已有公开版安装需要先在面板选择 **返回原网络**，确认已恢复，再关闭面板。用同一桌面管理员账户核对安装目录 `%ProgramFiles%\RackNerd-Connection` 的 `State` 中当前会话具有 `machine.ok`、`user.ok`，且任务计划程序中本工具的 `RNPublic-*` 恢复任务已结束并清理。然后备份该安装目录中的 `Gateway-Mode.ps1`，仅用本仓库 `windows/Gateway-Mode.ps1` 替换这个控制器，保留目标文件的管理员写入权限。若本地控制器有定制修改，应先合并差异。重新打开面板，从 **试用 15 分钟** 开始验收，再恢复原网络。安装器会拒绝直接覆盖内容不同的已安装控制器。
+
+在仓库根目录运行下面两个离线测试，无需管理员权限。测试使用虚构接口和文档保留地址，覆盖断开网卡残留路由、IPv4 尚未连接、两个有效物理出口、虚拟出口冲突，以及原有的定时恢复和面板状态逻辑。
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Offline.ps1
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\gui\Test-Status.ps1
+```
+
+同类修复已在实际 Windows 部署中通过出口、原生 DNS、HTTPS、恢复原网络及再次连接验证。公开版在此基础上适配了现有的多出口检查，并通过离线回归；部署者仍需在自己的设备上完成上述试用。
+
 ## 公开版与实际部署
 
 这套流程来自一次完成过浏览器、Python、桌面应用以及原网络恢复验证的部署。公开版使用独立的隧道名称 `rn-public` 和示例私网地址，服务器为 `10.203.84.1`，Windows 为 `10.203.84.2`。部署前先确认这两个地址不会与自己的本地网络或机构 VPN 冲突。UDP 端口默认 `51820`，自定义时两端和托管平台的防火墙都要一致，并避开客户端 DNS 策略使用的 `53` 和 `853`。

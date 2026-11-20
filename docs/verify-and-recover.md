@@ -50,6 +50,7 @@ python -c "import urllib.request as u; h=u.build_opener(u.ProxyHandler({})); r=h
 
 | 观察 | 下一项检查 |
 |---|---|
+| 点击连接后很快返回原网络，提示物理网关不唯一 | 同时查看 `Get-NetAdapter`、`Get-NetIPInterface -AddressFamily IPv4` 和 `Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore`。旧版可能把断开 WLAN 的残留默认路由计入总数；使用包含在线网卡和 IPv4 连接状态检查的新版控制器。若有两个实际在线出口，先确认本次应使用哪一个。更新与离线测试见 [Windows 指南](../windows/README.md#连接前检查修复与验证)。 |
 | SSH 能登录，WireGuard 没握手 | 核对双方公钥、端点地址和 UDP 端口。检查控制面板及系统防火墙的 UDP 入站。 |
 | 能 ping VPS 私网，公网不通 | 核对客户端的两条 IPv4 路由、VPS 的 IPv4 转发、限源转发规则和 NAT 回包计数。 |
 | 已知地址的 HTTPS 能通，普通域名失败 | 核对 Windows 有效 DNS 策略和加密 DNS 的路由。若 v2rayN TUN 已启用，先恢复原网络，再关闭该开关后重新试用。其 DNS 过滤可能在另一个接口被选中时仍然生效。 |
