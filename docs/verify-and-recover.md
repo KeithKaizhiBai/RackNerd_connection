@@ -48,6 +48,8 @@ python -c "import urllib.request as u; h=u.build_opener(u.ProxyHandler({})); r=h
 
 ## 看懂故障现象
 
+操作失败时，先查看面板底部的原因、处理方法和错误详情，再结合上方当前线路状态判断。详细提示的更新方式见 [Windows 界面说明](../windows/README.md#连接失败时的提示)。自动返回原网络后仍会保留本次失败说明。
+
 | 观察 | 下一项检查 |
 |---|---|
 | 点击连接后很快返回原网络，提示物理网关不唯一 | 同时查看 `Get-NetAdapter`、`Get-NetIPInterface -AddressFamily IPv4` 和 `Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore`。旧版可能把断开 WLAN 的残留默认路由计入总数；使用包含在线网卡和 IPv4 连接状态检查的新版控制器。若有两个实际在线出口，先确认本次应使用哪一个。更新与离线测试见 [Windows 指南](../windows/README.md#连接前检查修复与验证)。 |

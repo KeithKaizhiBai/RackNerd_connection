@@ -4,6 +4,7 @@ param([switch]$StatusOnly)
 $ErrorActionPreference = 'Stop'
 $statusLibrary = Join-Path $PSScriptRoot 'Gateway-Status.ps1'
 . $statusLibrary
+. (Join-Path (Split-Path $PSScriptRoot) 'windows\Gateway-Feedback.ps1')
 if ($StatusOnly) {
     $sample = Get-RnPanelSample $true
     $view = Get-RnPanelView $sample.Local $sample.Check
@@ -30,7 +31,7 @@ $form.Font = [Drawing.Font]::new('Microsoft YaHei UI',10)
 $form.BackColor = [Drawing.Color]::White
 $form.AutoScaleMode = 'Dpi'
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = [Drawing.Size]::new(680,366)
+$form.ClientSize = [Drawing.Size]::new(760,480)
 $form.MinimumSize = $form.Size
 $form.KeyPreview = $true
 $grid = [Windows.Forms.TableLayoutPanel]::new()
@@ -79,7 +80,11 @@ $restore=Add-PanelButton 'Restore' '返回原网络 (O)' 131
 $trial=Add-PanelButton 'Trial' '试用 15 分钟 (T)' 131
 $verify=Add-PanelButton 'Verify' '核验出口' 98
 $defaultNote='最小化可在系统托盘查看状态。关闭面板后，当前连接继续运行。'
-$note=Add-PanelLabel 'OperationResult' $defaultNote 7 0 2
+$note=[Windows.Forms.TextBox]::new()
+$note.Name='OperationResult';$note.Text=$defaultNote;$note.Multiline=$true;$note.ReadOnly=$true
+$note.Dock='Fill';$note.ScrollBars='Vertical';$note.WordWrap=$true;$note.BorderStyle='None'
+$note.BackColor=$form.BackColor
+$grid.Controls.Add($note,0,7);$grid.SetColumnSpan($note,2)
 $note.ForeColor=[Drawing.Color]::FromArgb(71,85,98)
 
 # Small persistent set of tray icons. Clone each managed icon before releasing its native handle.
@@ -115,6 +120,7 @@ $openItem.Add_Click({Show-Panel}); $exitItem.Add_Click({$form.Close()})
 $form.Add_Resize({if ($form.WindowState -eq 'Minimized') { $form.Hide() }})
 
 $controller=Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'RackNerd-Connection\Gateway-Mode.ps1'
+$panelAction=Join-Path (Split-Path $controller) 'Gateway-PanelAction.ps1'
 $winPS=Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
 $space=[runspacefactory]::CreateRunspace()
 $space.Open()
@@ -123,6 +129,7 @@ $timer.Interval=350
 $script:currentPath=$null; $script:check=$null; $script:reader=$null; $script:change=$null
 $script:nextRead=[datetime]::MinValue; $script:wantCheck=$false; $script:version=0
 $script:changingText=''; $script:activeAction=''; $script:readError=$null
+$script:operationFailure=$null;$script:requestId=$null;$script:requestStarted=[datetime]::MinValue
 
 function Paint-State {
     $v=Get-RnPanelView $script:currentPath $script:check
@@ -130,10 +137,12 @@ function Paint-State {
     if ($v.Kind -eq 'Verified') { $c=$green; $icon=$icons.Good }
     elseif ($v.Kind -ne 'Off') { $c=$amber; $icon=$icons.Wait }
     $heading=$v.Title
+    if($script:operationFailure){$heading='上次操作未完成';$c=$amber;$icon=$icons.Wait}
     if ($script:change) { $heading=$script:changingText; $c=$amber; $icon=$icons.Wait }
     $title.Text=$heading; $title.ForeColor=$c; $tray.Icon=$icon; $form.Icon=$icon
     $tray.Text="RackNerd · $heading"
     $hint.Text=$v.Hint
+    if($script:operationFailure){$hint.Text='当前状态　'+$v.Title+'。失败原因和处理方法见下方。'}
     if ($script:readError) { $hint.Text='无法读取当前 Windows 网络，稍后将自动重试。' }
     $values[0].Text=$v.Ip
     $values[1].Text=if ($script:currentPath) { $script:currentPath.Route } else { '未知' }
@@ -157,13 +166,18 @@ function Start-PanelRead([bool]$Public) {
 function Request-PanelChange([ValidateSet('RackNerd','Test','Original')][string]$Action) {
     if ($script:change) { return }
     try {
-        # Only the preinstalled controller is elevated. Paths and actions are fixed.
-        $arguments='-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "'+$controller+'" -Action '+$Action
+        if(-not (Test-Path -LiteralPath $panelAction -PathType Leaf)){throw 'Panel feedback component is missing; update the protected installation.'}
+        $script:requestId=[guid]::NewGuid().ToString('N');$script:requestStarted=[datetime]::UtcNow
+        $arguments='-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "'+$panelAction+'" -Action '+$Action+' -RequestId '+$script:requestId
         $script:change=Start-Process -FilePath $winPS -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments -PassThru -ErrorAction Stop
         $script:activeAction=$Action; $script:version++; $script:check=$null
+        $script:operationFailure=$null
         $script:changingText=if ($Action -eq 'Original') {'正在恢复原网络…'} else {'正在连接 RackNerd…'}
         $note.Text='正在应用你的选择。'
-    } catch { $note.Text='切换未启动。请确认 Windows 管理员提示后重试。' }
+    } catch {
+        $script:operationFailure=[pscustomobject]@{Code='Launch';Reason='管理员操作未能启动。';Help='确认 Windows 管理员提示；若已取消，可重新点击。缺少反馈组件时，请更新安装目录中的两个反馈脚本。';Detail=(Protect-RnFailureText $_.Exception.Message)}
+        $note.Text=Format-RnFailure $script:operationFailure
+    }
     Paint-State
 }
 $connect.Add_Click({Request-PanelChange 'RackNerd'})
@@ -183,7 +197,9 @@ function Update-Panel {
     if ($script:change -and $script:change.HasExited) {
         $code=$script:change.ExitCode; $script:change.Dispose(); $script:change=$null
         $script:version++; $script:check=$null; $script:wantCheck=$true; $script:nextRead=[datetime]::MinValue
-        $note.Text=if ($code -ne 0) { '切换未完成。请查看当前线路，必要时点「返回原网络」。' }
+        $outcome=Read-RnPanelResult (Split-Path $controller) $script:requestId $script:activeAction $script:requestStarted $code
+        $script:operationFailure=if($outcome.Success){$null}else{$outcome.Failure}
+        $note.Text=if ($script:operationFailure) { Format-RnFailure $script:operationFailure }
             elseif ($script:activeAction -eq 'Original') { '已恢复 Windows 设置。原网络需要其他 VPN 或 TUN 时，可重新开启它。' }
             elseif ($script:activeAction -eq 'Test') { '试用已开始。15 分钟后自动还原，也可提前点「返回原网络」。' }
             else { $defaultNote }

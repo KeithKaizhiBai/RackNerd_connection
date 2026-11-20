@@ -61,7 +61,7 @@ New-RnDirectory $state $false
 $lock=[IO.File]::Open((Join-Path $vault 'install.lock'),'OpenOrCreate','ReadWrite','None')
 try {
     # Same-release repair is idempotent. Do not replace code used by a session or by pending recovery tasks.
-    $files=@('Gateway-Common.ps1','Gateway-Service.ps1','Gateway-WinInet.ps1','Prepare-Profile.ps1','Gateway-Mode.ps1')
+    $files=@('Gateway-Common.ps1','Gateway-Service.ps1','Gateway-WinInet.ps1','Prepare-Profile.ps1','Gateway-Mode.ps1','Gateway-Feedback.ps1','Gateway-PanelAction.ps1')
     foreach ($name in $files) {
         $src=Join-Path $PSScriptRoot $name; $dest=Join-Path $base $name
         $sourceItem=Get-Item -Force -LiteralPath $src -ErrorAction Stop

@@ -52,6 +52,16 @@ Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路�
 
 只想从终端查看状态时，在仓库根目录运行 `.\gui\RackNerd-Network.cmd Status`。面板最小化后可从托盘打开，关闭窗口后隧道继续按所选模式运行。
 
+### 连接失败时的提示
+
+连接或恢复失败后，窗口保留三项信息，包括具体原因、对应处理方法和脱敏后的技术错误。上方同时显示当前线路状态。自动刷新会继续核验线路，失败说明一直保留到下一次操作；后续操作成功时清除旧错误。详情区域支持滚动、选择和复制。
+
+提示覆盖物理网关不唯一、其他 TUN/VPN 冲突、路由冲突、系统 DNS、WireGuard 服务、握手、公网出口以及配置权限检查。管理员提示被取消、反馈组件缺失或结果文件异常时，窗口也会给出对应说明。恢复相关错误只表明过程曾报错，最终恢复情况应结合当前线路和再次执行“返回原网络”确认。
+
+新安装会同时安装 `Gateway-PanelAction.ps1` 和 `Gateway-Feedback.ps1`。已有公开版安装更新此界面时，在管理员权限下将这两个 `windows/` 文件复制到 `%ProgramFiles%\RackNerd-Connection`，沿用安装目录的管理员写权限，再使用新版 `gui/Gateway-Panel.ps1` 和配套 `windows/Gateway-Feedback.ps1`。关闭旧面板后重新打开即可。该更新入口沿用已有控制器，安装器继续执行自身的版本一致性检查。
+
+每次操作使用独立请求标识，结果写到安装目录的 `PanelResults`。普通桌面用户可读取，写入权限限于管理员和 SYSTEM。界面会拒绝串号、过期、损坏或缺失的结果，保留“结果待确认”的说明。错误详情会遮蔽地址、路径和常见凭据字段，运行结果文件留在本机。提交问题单前仍需检查准备分享的文字内容。
+
 ## 连接前检查修复与验证
 
 2026-11-20 修复了断开 WLAN 后仍保留默认路由时的误报。旧版统计所有默认路由，可能在点击连接后以 `Need one unambiguous physical IPv4 default route` 退出。新版同时检查网卡 `Up` 和 IPv4 接口 `Connected`，从 `ActiveStore` 中选取有效默认路由。断开接口上的残留默认路由会被忽略；它们仍保留在 Windows 中。
@@ -65,6 +75,7 @@ Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路�
 ```powershell
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Offline.ps1
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\gui\Test-Status.ps1
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Feedback.ps1
 ```
 
 同类修复已在实际 Windows 部署中通过出口、原生 DNS、HTTPS、恢复原网络及再次连接验证。公开版在此基础上适配了现有的多出口检查，并通过离线回归；部署者仍需在自己的设备上完成上述试用。
