@@ -4,6 +4,13 @@
 
 ## Windows 是否真正经 VPS 上网
 
+双网卡验收时保持 Wi-Fi 和有线网在线，关闭其他客户端的 TUN。将 `$VpsIPv4` 设为自己的 VPS 公网地址，在连接前、试用中、返回原网络后三次运行下面一行。Windows 会分别返回路由和源地址。试用中的端点前缀应为 `/32`，网卡、下一跳和源地址应与连接前一致。返回原网络后，临时路由应消失，端点应恢复原来的前缀。切换期间保持相同的物理线路条件，以便比较结果。
+
+```powershell
+Find-NetRoute -RemoteIPAddress $VpsIPv4 |
+    Select-Object InterfaceAlias, InterfaceIndex, DestinationPrefix, NextHop, IPAddress
+```
+
 在普通 PowerShell 运行。公网查询使用 HTTPS，禁用 curl 的配置文件和应用代理，以 Windows 的实际 IPv4 路由访问目标。第三方出口服务会看到这一次请求的公网源地址。将回显地址与你自己服务面板中的 VPS 公网 IPv4 比较。
 
 ```powershell
@@ -52,7 +59,7 @@ python -c "import urllib.request as u; h=u.build_opener(u.ProxyHandler({})); r=h
 
 | 观察 | 下一项检查 |
 |---|---|
-| 点击连接后很快返回原网络，提示物理网关不唯一 | 同时查看 `Get-NetAdapter`、`Get-NetIPInterface -AddressFamily IPv4` 和 `Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore`。旧版可能把断开 WLAN 的残留默认路由计入总数；使用包含在线网卡和 IPv4 连接状态检查的新版控制器。若有两个实际在线出口，先确认本次应使用哪一个。更新与离线测试见 [Windows 指南](../windows/README.md#连接前检查修复与验证)。 |
+| 双网卡在线时旧版提示物理网关不唯一 | 按[Windows 指南](../windows/README.md#连接前检查修复与验证)更新控制器及面板。两张网卡都可保留，重试前用上面的命令查看到 VPS 的实际线路。如果选中其他 VPN 的虚拟网卡，先关闭对应 TUN。 |
 | SSH 能登录，WireGuard 没握手 | 核对双方公钥、端点地址和 UDP 端口。检查控制面板及系统防火墙的 UDP 入站。 |
 | 能 ping VPS 私网，公网不通 | 核对客户端的两条 IPv4 路由、VPS 的 IPv4 转发、限源转发规则和 NAT 回包计数。 |
 | 已知地址的 HTTPS 能通，普通域名失败 | 核对 Windows 有效 DNS 策略和加密 DNS 的路由。若 v2rayN TUN 已启用，先恢复原网络，再关闭该开关后重新试用。其 DNS 过滤可能在另一个接口被选中时仍然生效。 |

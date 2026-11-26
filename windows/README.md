@@ -56,7 +56,7 @@ Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路�
 
 连接或恢复失败后，窗口保留三项信息，包括具体原因、对应处理方法和脱敏后的技术错误。上方同时显示当前线路状态。自动刷新会继续核验线路，失败说明一直保留到下一次操作；后续操作成功时清除旧错误。详情区域支持滚动、选择和复制。
 
-提示覆盖物理网关不唯一、其他 TUN/VPN 冲突、路由冲突、系统 DNS、WireGuard 服务、握手、公网出口以及配置权限检查。管理员提示被取消、反馈组件缺失或结果文件异常时，窗口也会给出对应说明。恢复相关错误只表明过程曾报错，最终恢复情况应结合当前线路和再次执行“返回原网络”确认。
+面板会提示 Windows 到 VPS 的物理线路是否可用，以及其他 TUN/VPN、路由、系统 DNS、WireGuard 服务、握手、出口或权限方面的错误。管理员提示被取消、反馈组件缺失或结果文件异常时，窗口也会给出对应说明。恢复报错后，可在面板核对当前线路，再选择“返回原网络”。
 
 新安装会同时安装 `Gateway-PanelAction.ps1` 和 `Gateway-Feedback.ps1`。已有公开版安装更新此界面时，在管理员权限下将这两个 `windows/` 文件复制到 `%ProgramFiles%\RackNerd-Connection`，沿用安装目录的管理员写权限，再使用新版 `gui/Gateway-Panel.ps1` 和配套 `windows/Gateway-Feedback.ps1`。关闭旧面板后重新打开即可。该更新入口沿用已有控制器，安装器继续执行自身的版本一致性检查。
 
@@ -64,13 +64,13 @@ Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路�
 
 ## 连接前检查修复与验证
 
-2026-11-20 修复了断开 WLAN 后仍保留默认路由时的误报。旧版统计所有默认路由，可能在点击连接后以 `Need one unambiguous physical IPv4 default route` 退出。新版同时检查网卡 `Up` 和 IPv4 接口 `Connected`，从 `ActiveStore` 中选取有效默认路由。断开接口上的残留默认路由会被忽略；它们仍保留在 Windows 中。
+**Wi-Fi 和有线网可以同时在线。** 关闭 v2rayN 的“启用 TUN”，保留两张物理网卡，点击“连接 RackNerd”或“试用 15 分钟”。每次连接时，控制器都会用 `Find-NetRoute` 查询 Windows 到 VPS 公网 IPv4 的实际路由和源地址，确认选中的是已连接的物理网卡，再为该 VPS 建立临时的单地址路由。两张网卡原有的默认路由和优先级保持原值。
 
-实际同时存在两个有效出口、正在运行的其他 VPN/TUN、端点专用路由或其他路由冲突，仍需要先处理。此修复解决网关选择阶段的误判，后续的 DNS、握手和真实出口核验继续执行。故障定位见[验收与恢复](../docs/verify-and-recover.md)。
+旧控制器要求恰好一个物理出口，两张网卡都可用时可能提示 `Need one unambiguous physical IPv4 default route`。新版按目的地选路，也会复查接口、下一跳和源地址。其他 VPN/TUN 占用端点、已有该 VPS 的单地址路由，或连接过程中线路变化时，按面板提示处理。连接期间如果需要更换承载隧道的物理网卡，点“返回原网络”，等新线路就绪后重新连接。[验收与恢复](../docs/verify-and-recover.md)
 
-已有公开版安装需要先在面板选择 **返回原网络**，确认已恢复，再关闭面板。用同一桌面管理员账户核对安装目录 `%ProgramFiles%\RackNerd-Connection` 的 `State` 中当前会话具有 `machine.ok`、`user.ok`，且任务计划程序中本工具的 `RNPublic-*` 恢复任务已结束并清理。然后备份该安装目录中的 `Gateway-Mode.ps1`，仅用本仓库 `windows/Gateway-Mode.ps1` 替换这个控制器，保留目标文件的管理员写入权限。若本地控制器有定制修改，应先合并差异。重新打开面板，从 **试用 15 分钟** 开始验收，再恢复原网络。安装器会拒绝直接覆盖内容不同的已安装控制器。
+已有公开版安装先在面板选择 **返回原网络**，确认已恢复，再关闭面板。用同一桌面管理员账户核对安装目录 `%ProgramFiles%\RackNerd-Connection` 的 `State` 中当前会话具有 `machine.ok`、`user.ok`，且本工具的 `RNPublic-*` 恢复任务已清理。备份该目录中的 `Gateway-Mode.ps1` 和 `Gateway-Feedback.ps1`，用本仓库 `windows/` 下的同名文件更新，保留目标文件的管理员写入权限。若本地有定制修改，请先核对差异。用本版本配套的 `gui/` 目录重新打开面板，从 **试用 15 分钟** 开始验收，再恢复原网络。
 
-在仓库根目录运行下面两个离线测试，无需管理员权限。测试使用虚构接口和文档保留地址，覆盖断开网卡残留路由、IPv4 尚未连接、两个有效物理出口、虚拟出口冲突，以及原有的定时恢复和面板状态逻辑。
+在仓库根目录运行下面三个离线测试，无需管理员权限。虚构接口和文档保留地址用于检查双网卡选路、断开或虚拟网卡、线路变化、恢复及面板提示。
 
 ```powershell
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Offline.ps1
@@ -78,7 +78,7 @@ powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Feedback.ps1
 ```
 
-同类修复已在实际 Windows 部署中通过出口、原生 DNS、HTTPS、恢复原网络及再次连接验证。公开版在此基础上适配了现有的多出口检查，并通过离线回归；部署者仍需在自己的设备上完成上述试用。
+实际 Windows 部署在 Wi-Fi 和有线网同时在线时完成了“试用 → 返回原网络 → 再次连接”。Windows 当次选择有线网，两次连接的端点网卡、下一跳和源地址均与连接前一致。WireGuard 握手、面板出口核验、系统 DNS 和 HTTPS 请求通过。回退后已核对原有默认路由、端点路由及试用规则和任务的清理。公开版的选路函数也在同一台机器上与 Windows 的实际结果作了对照。Windows 选中 Wi-Fi 的情形由离线回归覆盖。
 
 ## 公开版与实际部署
 

@@ -18,14 +18,20 @@ function Protect-RnFailureText([string]$Text) {
 function Get-RnFailureInfo([string]$Message) {
     $code='Unknown';$reason='操作发生错误。';$help='查看下方错误详情。若线路未恢复，点击“返回原网络”，再检查本机诊断日志。'
     switch -Regex ($Message) {
+        'Endpoint route creation was not confirmed|Endpoint route adapter identity is ambiguous during recovery' {
+            $code='Recovery';$reason='无法确认端点路由归属，已保留该路由；恢复状态需要核验。';$help='检查 VPS 端点现有的 /32 路由和本次会话状态。确认其创建来源后再处理，不要删除其他软件的路由。';break
+        }
         'Cleanup failed|recovery.*fail|restor.*fail|still present|still needs rollback|restoration failed|Resolver settings changed externally|flags differ' {
             $code='Recovery';$reason='恢复相关操作报错，最终状态需要核验。';$help='先查看当前线路，再点击“返回原网络”确认恢复，使用最初连接时的 Windows 账户操作。确认恢复后再开启其他 TUN。';break
         }
-        'unambiguous physical|default gateway' {
-            $code='Gateway';$reason='未找到唯一可用的物理网关。';$help='检查以太网和 WLAN 是否已连接。若两者都在线，选择本次需要的连接；若另一张网卡已断开，请更新包含网关检查修复的控制器。';break
-        }
         'Xray TUN|VPN or TUN|virtual network is active|active VPN|competing VPN' {
             $code='Tun';$reason='其他 VPN 或 TUN 正在占用网络。';$help='先在 v2rayN 或对应 VPN 客户端中关闭 TUN/断开连接，再点击连接 RackNerd。';break
+        }
+        'Windows endpoint route.*(failed|ambiguous|incomplete|disconnected|no usable)|unambiguous physical|default gateway' {
+            $code='Gateway';$reason='Windows 未能确定可用的 VPS 物理出口。';$help='确认以太网或 WLAN 的 IPv4 已连接。两张物理网卡可以同时在线，工具会采用 Windows 实际选路；等待网络稳定后重试。旧版单网关提示需要更新控制器。';break
+        }
+        'endpoint route changed|endpoint route points to a local' {
+            $code='Route';$reason='VPS 端点路径在切换中发生变化，或配置指向本机。';$help='先返回原网络，核对 VPS 地址，待网卡连接和地址稳定后重试。工具不会替换现有路由，也不会切换其他 VPN。';break
         }
         'specific endpoint route|half-default|/1 routes|routed prefixes|route.*lost|Unexpected route|management endpoint|Tunnel identity' {
             $code='Route';$reason='现有路由或隧道与本次连接冲突。';$help='先点击“返回原网络”，确认其他 VPN 已退出，再重试。仍失败时检查相关路由和隧道状态。';break

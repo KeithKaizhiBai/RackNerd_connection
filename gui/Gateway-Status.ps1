@@ -125,7 +125,8 @@ function Get-RnLocalPath($Settings) {
         }
     }
     $adapters = @(Get-NetAdapter -ErrorAction Stop)
-    $physical = @($adapters | Where-Object { $_.HardwareInterface -and $_.Status -eq 'Up' })
+    $physical = @($adapters | Where-Object { $_.HardwareInterface -and $_.Status -eq 'Up' -and
+        $_.ifIndex -in $interfaces.InterfaceIndex })
     $tunnel = $adapters | Where-Object Name -eq $script:RnTunnelName | Select-Object -First 1
     $serviceName = 'WireGuardTunnel$' + $script:RnTunnelName
     $service = Get-Service -Name 'WireGuardTunnel$*' -ErrorAction Stop |
@@ -138,10 +139,18 @@ function Get-RnLocalPath($Settings) {
             $_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource })
     }
 
-    $endpoint = @(Find-NetRoute -RemoteIPAddress $Settings.Endpoint -ErrorAction Stop |
-        Where-Object DestinationPrefix)[0]
-    $physicalEndpoint = $endpoint -and $endpoint.DestinationPrefix -eq ($Settings.Endpoint + '/32') -and
-        $endpoint.InterfaceIndex -in $physical.ifIndex
+    $endpointAnswer = @(Find-NetRoute -RemoteIPAddress $Settings.Endpoint -ErrorAction Stop)
+    $endpointRoutes = @($endpointAnswer | Where-Object DestinationPrefix)
+    $endpointSources = @($endpointAnswer | Where-Object IPAddress)
+    $endpoint = if ($endpointRoutes.Count -eq 1) { $endpointRoutes[0] } else { $null }
+    $endpointSource = if ($endpointSources.Count -eq 1) { $endpointSources[0] } else { $null }
+    $physicalEndpoint = $endpoint -and $endpointSource -and
+        $endpoint.DestinationPrefix -eq ($Settings.Endpoint + '/32') -and
+        $endpoint.InterfaceIndex -in $physical.ifIndex -and $endpointSource.InterfaceIndex -eq $endpoint.InterfaceIndex -and
+        $endpointSource.AddressState -eq 'Preferred' -and $endpointSource.SkipAsSource -eq $false -and
+        (Test-RnIPv4Literal ([string]$endpointSource.IPAddress))
+    $endpointAdapter = @($physical | Where-Object ifIndex -eq $endpoint.InterfaceIndex)
+    if ($endpointAdapter.Count -ne 1) { $physicalEndpoint=$false }
     $used = @($used | Select-Object -Unique)
     $otherTun = [bool]($adapters | Where-Object {
         $driver = $_.Name + ' ' + $_.InterfaceDescription
@@ -153,7 +162,8 @@ function Get-RnLocalPath($Settings) {
     $hasGateway = ($tunnel -and $tunnel.Status -eq 'Up') -or
         ($service -and $service.Status -ne 'Stopped') -or $script:RnTunnelName -in $used
     $identity += @($serviceState, $flags, $hasGateway, $both, $source, $physicalEndpoint, $otherTun,
-        $endpoint.InterfaceIndex, $endpoint.NextHop)
+        $endpoint.InterfaceIndex, $endpoint.DestinationPrefix, $endpoint.NextHop, $endpointSource.IPAddress,
+        $endpointAdapter.InterfaceGuid, $endpointRoutes.Count, $endpointSources.Count)
     [pscustomobject]@{
         Key=($identity -join '|'); At=$now; Config='Ready'; Endpoint=$Settings.Endpoint
         Service=$serviceState; HasGateway=$hasGateway; Both=$both; HasSource=$source

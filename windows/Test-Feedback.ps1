@@ -1,10 +1,20 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # Offline error and result tests. Uses only synthetic data in a new temporary directory.
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Gateway-Feedback.ps1')
 function Check($Condition,[string]$Message){if(-not $Condition){throw $Message}}
 $cases=@{
     'Need one unambiguous physical IPv4 default route'='Gateway'
+    'Windows endpoint route lookup failed. Check the physical network and retry.'='Gateway'
+    'Windows endpoint route selection is ambiguous or incomplete.'='Gateway'
+    'Windows endpoint route uses a disconnected physical IPv4 interface.'='Gateway'
+    'Windows endpoint route has no usable IPv4 source or next hop.'='Gateway'
+    'Windows endpoint route changed during the switch. Restore Original and retry on a stable network.'='Route'
+    'The endpoint route points to a local workstation address.'='Route'
+    'Endpoint route creation was not confirmed; the existing route was preserved.'='Recovery'
+    'Endpoint route adapter identity is ambiguous during recovery.'='Recovery'
+    'Windows endpoint route uses a VPN or TUN instead of a physical adapter.'='Tun'
+    'Another VPN or TUN default route is active. Disconnect it before switching.'='Tun'
     'The active Xray TUN enforces its own DNS'='Tun'
     'Another VPN or TUN adapter is active'='Tun'
     'A specific endpoint route already exists'='Route'
@@ -21,6 +31,7 @@ $cases=@{
     'Resolver restoration failed'='Recovery'
     'An unrecognized fixture failure'='Unknown'
 }
+Check ((Get-RnFailureInfo 'Windows endpoint route selection is ambiguous or incomplete.').Help.Contains('两张物理网卡可以同时在线')) 'Dual physical network guidance is missing'
 foreach($message in $cases.Keys){
     $r=Invoke-RnPanelOperation {throw $message}
     Check (-not $r.Success -and $r.Failure.Code -ceq $cases[$message]) ('Wrong error classification: '+$message)

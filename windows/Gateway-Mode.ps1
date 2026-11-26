@@ -99,6 +99,29 @@ function Get-OwnFirewallRules {
     # Enumerate once with a terminating error: "store unavailable" must never mean "nothing to undo".
     Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop | Where-Object Group -eq $st.Tag
 }
+function Remove-RnEndpointRoute {
+    if(-not (Has 'route.intent') -or
+        (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o') -ne $st.Boot) {return}
+    $adapter=@(Get-NetAdapter -ErrorAction Stop | Where-Object ifIndex -eq $st.K)
+    if($adapter.Count -gt 1) {throw 'Endpoint route adapter identity is ambiguous during recovery.'}
+    if(-not $adapter.Count -or [string]$adapter[0].InterfaceGuid -ne $st.AdapterGuid) {return}
+    $candidate=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {
+        $_.DestinationPrefix -eq $endpointPrefix -and $_.InterfaceIndex -eq $st.K -and
+        $_.NextHop -eq $st.GW -and $_.RouteMetric -eq $st.RouteMetric
+    })
+    if(-not $candidate.Count) {return}
+    # In older sessions svc.intent was written only after New-NetRoute succeeded.
+    # An intent-only record cannot establish ownership, regardless of its version.
+    $confirmed=(Has 'route.created') -or ($st.RouteOwnershipVersion -lt 2 -and (Has 'svc.intent'))
+    if($candidate.Count -ne 1 -or -not $confirmed) {
+        throw 'Endpoint route creation was not confirmed; the existing route was preserved.'
+    }
+    $candidate | Remove-NetRoute -Confirm:$false
+    if(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {
+        $_.DestinationPrefix -eq $endpointPrefix -and $_.InterfaceIndex -eq $st.K -and
+        $_.NextHop -eq $st.GW -and $_.RouteMetric -eq $st.RouteMetric
+    }) {throw 'Endpoint route still present after recovery.'}
+}
 function UndoMachine{
     if(Has 'machine.ok'){return}
         $issues=@()
@@ -119,13 +142,7 @@ function UndoMachine{
             if($rule.Name -notin @(($st.Tag+'-v6'),($st.Tag+'-udp'),($st.Tag+'-tcp'))){throw 'Unexpected rule in owned group'}
             Remove-NetFirewallRule -PolicyStore PersistentStore -Name $rule.Name
         }}catch{$issues+='Firewall: '+$_.Exception.Message}
-        try{if((Has 'route.intent') -and (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o') -eq $st.Boot){
-            $adapter=Get-NetAdapter -InterfaceIndex $st.K -ErrorAction SilentlyContinue
-            if($adapter -and [string]$adapter.InterfaceGuid -eq $st.AdapterGuid){
-            Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -DestinationPrefix $endpointPrefix -InterfaceIndex $st.K -NextHop $st.GW -ErrorAction SilentlyContinue |
-                Where-Object RouteMetric -eq $st.RouteMetric | Remove-NetRoute -Confirm:$false
-            }
-        }}catch{$issues+='Endpoint route: '+$_.Exception.Message}
+        try{Remove-RnEndpointRoute}catch{$issues+='Endpoint route: '+$_.Exception.Message}
         if($issues.Count){throw ($issues -join '; ')}
         if((Get-DnsClientNrptRule | Where-Object Comment -eq $st.Tag) -or (Get-OwnFirewallRules)){throw 'Owned DNS or firewall rules still present'}
         if(Get-NetRoute -AddressFamily IPv4 -InterfaceAlias rn-public -ErrorAction SilentlyContinue){throw 'New tunnel route still present'}
@@ -144,6 +161,65 @@ function UndoUser{
     if($after.Flags -ne $st.Proxy.Flags){throw 'WinINET flags differ from original'}
     Trace-Line "Desktop proxy recovery ok ($sid)"; Mark 'user.ok'
 }
+function Get-RnEndpointPath([string]$RemoteIPAddress) {
+    # Ask Windows for its actual route AND source address. Do not reproduce route
+    # selection by ranking adapter/default-route metrics (which misses host routes).
+    try {$answer=@(Find-NetRoute -RemoteIPAddress $RemoteIPAddress -ErrorAction Stop)}
+    catch {throw 'Windows endpoint route lookup failed. Check the physical network and retry.'}
+    $chosen=@($answer | Where-Object DestinationPrefix)
+    $source=@($answer | Where-Object IPAddress)
+    if($chosen.Count -ne 1 -or $source.Count -ne 1 -or
+        $chosen[0].InterfaceIndex -ne $source[0].InterfaceIndex) {
+        throw 'Windows endpoint route selection is ambiguous or incomplete.'
+    }
+    $route=$chosen[0]; $address=$source[0]
+    $adapters=@(Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop)
+    $interfaces=@(Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop)
+    if($adapters.Count -ne 1 -or -not $adapters[0].HardwareInterface) {throw 'Windows endpoint route uses a VPN or TUN instead of a physical adapter.'}
+    if($adapters[0].Status -ne 'Up' -or $interfaces.Count -ne 1 -or $interfaces[0].ConnectionState -ne 'Connected') {
+        throw 'Windows endpoint route uses a disconnected physical IPv4 interface.'
+    }
+    $local=$null; $next=$null
+    if($address.AddressState -ne 'Preferred' -or $address.SkipAsSource -ne $false -or
+        -not [ipaddress]::TryParse([string]$address.IPAddress,[ref]$local) -or $local.AddressFamily -ne 'InterNetwork' -or
+        -not [ipaddress]::TryParse([string]$route.NextHop,[ref]$next) -or $next.AddressFamily -ne 'InterNetwork' -or
+        [string]::IsNullOrWhiteSpace([string]$adapters[0].InterfaceGuid)) {
+        throw 'Windows endpoint route has no usable IPv4 source or next hop.'
+    }
+    if($RemoteIPAddress -ceq [string]$address.IPAddress) {throw 'The endpoint route points to a local workstation address.'}
+    [pscustomobject]@{
+        RemoteIPAddress=$RemoteIPAddress;InterfaceIndex=[int]$route.InterfaceIndex
+        InterfaceAlias=[string]$adapters[0].Name;AdapterGuid=[string]$adapters[0].InterfaceGuid
+        NextHop=[string]$route.NextHop;SourceAddress=[string]$address.IPAddress
+        DestinationPrefix=[string]$route.DestinationPrefix;RouteMetric=[int]$route.RouteMetric
+    }
+}
+function Assert-RnEndpointPath($Expected,[switch]$Pinned,[int]$Metric) {
+    $now=Get-RnEndpointPath $Expected.RemoteIPAddress
+    $prefix=if($Pinned){$Expected.RemoteIPAddress+'/32'}else{$Expected.DestinationPrefix}
+    if($now.InterfaceIndex -ne $Expected.InterfaceIndex -or $now.AdapterGuid -ne $Expected.AdapterGuid -or
+        $now.NextHop -ne $Expected.NextHop -or $now.SourceAddress -ne $Expected.SourceAddress -or
+        $now.DestinationPrefix -ne $prefix -or ($Pinned -and $now.RouteMetric -ne $Metric)) {
+        throw 'Windows endpoint route changed during the switch. Restore Original and retry on a stable network.'
+    }
+}
+function Assert-RnEndpointRouteAvailable {
+    foreach($scope in 'ActiveStore','PersistentStore') {
+        # Do not filter the provider by IPv4: an empty family can raise a CIM
+        # "no matching objects" error. The exact /32 match is evaluated locally.
+        if(Get-NetRoute -PolicyStore $scope -ErrorAction Stop | Where-Object DestinationPrefix -eq $endpointPrefix) {
+            throw ('A specific endpoint route already exists in '+$scope+'; it will not be replaced.')
+        }
+    }
+}
+function New-RnEndpointRoute {
+    Assert-RnEndpointRouteAvailable
+    Assert-RnEndpointPath $st.EndpointPath
+    Mark 'route.intent'
+    New-NetRoute -AddressFamily IPv4 -DestinationPrefix $endpointPrefix -InterfaceIndex $st.K -NextHop $st.GW -PolicyStore ActiveStore -RouteMetric $st.RouteMetric -ErrorAction Stop | Out-Null
+    Mark 'route.created'
+    Assert-RnEndpointPath $st.EndpointPath -Pinned -Metric $st.RouteMetric
+}
 function NewState($kind){
     if(Test-Path -LiteralPath $current){
         $last=(Get-Content -LiteralPath $current -Raw).Trim()
@@ -161,12 +237,9 @@ function NewState($kind){
         $_.DestinationPrefix -eq '0.0.0.0/0' -and
         $_.InterfaceIndex -in $connectedIPv4 -and $_.InterfaceIndex -in $onlineAdapters
     })
-    $phys=@($gateways | Where-Object {
-        $index=$_.InterfaceIndex
-        $_.NextHop -ne '0.0.0.0' -and @($adapters | Where-Object {$_.ifIndex -eq $index -and $_.HardwareInterface -and $_.Status -eq 'Up'}).Count -eq 1
-    })
-    if ($phys.Count -ne 1 -or $gateways.Count -ne 1) { throw 'Need one unambiguous physical IPv4 default route. Disconnect competing VPNs or a second uplink first.' }
-    if ($routes | Where-Object DestinationPrefix -eq $endpointPrefix) {throw 'A specific endpoint route already exists; it will not be replaced.'}
+    $physicalIndexes=@($adapters | Where-Object HardwareInterface | ForEach-Object ifIndex)
+    if($gateways | Where-Object {$_.InterfaceIndex -notin $physicalIndexes}) {throw 'Another VPN or TUN default route is active. Disconnect it before switching.'}
+    Assert-RnEndpointRouteAvailable
     if (($routes | Where-Object DestinationPrefix -in '0.0.0.0/1','128.0.0.0/1') -or
         (Get-Service -Name 'WireGuardTunnel$rn-public' -ErrorAction SilentlyContinue) -or
         (Get-NetIPAddress -IPAddress '10.203.84.2' -ErrorAction SilentlyContinue)) {throw 'Tunnel identity, address, or half-default routes already in use.'}
@@ -181,8 +254,9 @@ function NewState($kind){
     }
     # An arbitrary more-specific route through a different gateway can defeat both /1 routes.
     if ($routes | Where-Object {$_.DestinationPrefix -ne '0.0.0.0/0' -and $_.NextHop -ne '0.0.0.0'}) {throw 'Existing routed prefixes require individual review before enabling a full gateway.'}
-    $before=@(Find-NetRoute -RemoteIPAddress $endpoint | Where-Object DestinationPrefix)
-    if ($before.Count -ne 1 -or $before[0].InterfaceIndex -ne $phys[0].InterfaceIndex -or $before[0].NextHop -ne $phys[0].NextHop) {throw 'The current management endpoint does not already use the selected physical gateway.'}
+    $selectedEndpoint=Get-RnEndpointPath $endpoint
+    if($selectedEndpoint.DestinationPrefix -eq $endpointPrefix) {throw 'A specific endpoint route already exists; it will not be replaced.'}
+    if($selectedEndpoint.DestinationPrefix -ne '0.0.0.0/0' -and $selectedEndpoint.NextHop -ne '0.0.0.0') {throw 'Existing routed prefixes require individual review before enabling a full gateway.'}
     foreach ($tunnelAddress in '10.203.84.1','10.203.84.2') {
         $selected=@(Find-NetRoute -RemoteIPAddress $tunnelAddress | Where-Object DestinationPrefix)
         if ($selected.Count -ne 1 -or $selected[0].DestinationPrefix -ne '0.0.0.0/0') {throw 'An existing network already routes the private tunnel addresses. No settings were changed.'}
@@ -192,10 +266,13 @@ function NewState($kind){
     $proxy=Get-RnProxySnapshot -ExpectedSid $sid
     $doh=@(Get-DnsClientDohServerAddress -ServerAddress '1.1.1.1','9.9.9.9' | Select-Object ServerAddress,DohTemplate,AutoUpgrade,AllowFallbackToUdp)
     if($doh.Count -ne 2 -or ($doh | Where-Object {$_.DohTemplate -notin 'https://cloudflare-dns.com/dns-query','https://dns.quad9.net/dns-query'})){throw 'Unexpected native DNS-over-HTTPS templates'}
+    Assert-RnEndpointPath $selectedEndpoint
     $script:Id=[guid]::NewGuid().ToString('N'); $script:td=Join-Path $store $Id; New-SessionDirectory $td
-    $script:st=[pscustomobject]@{Id=$Id;Kind=$kind;UserSid=$sid;K=[int]$phys[0].InterfaceIndex;GW=[string]$phys[0].NextHop;Tag="RNPublic-$Id";Proxy=$proxy;Net=(NetBaseline);Boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')}
+    $script:st=[pscustomobject]@{Id=$Id;Kind=$kind;UserSid=$sid;K=$selectedEndpoint.InterfaceIndex;GW=$selectedEndpoint.NextHop;Tag="RNPublic-$Id";Proxy=$proxy;Net=(NetBaseline);Boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')}
     Add-Member -InputObject $st -NotePropertyName RouteMetric -NotePropertyValue (Get-Random -Minimum 3500 -Maximum 29000)
-    Add-Member -InputObject $st -NotePropertyName AdapterGuid -NotePropertyValue ([string](Get-NetAdapter -InterfaceIndex $st.K).InterfaceGuid)
+    Add-Member -InputObject $st -NotePropertyName AdapterGuid -NotePropertyValue $selectedEndpoint.AdapterGuid
+    Add-Member -InputObject $st -NotePropertyName EndpointPath -NotePropertyValue $selectedEndpoint
+    Add-Member -InputObject $st -NotePropertyName RouteOwnershipVersion -NotePropertyValue 2
     Add-Member -InputObject $st -NotePropertyName Doh -NotePropertyValue $doh
     $st | Export-Clixml -LiteralPath (Join-Path $td 'baseline.xml')
     [IO.File]::WriteAllText($current,$Id)
@@ -211,6 +288,7 @@ function LoadState{
 }
 function EnableMode{
     if (Has 'stop.requested'){throw 'Local recovery requested'}
+    Assert-RnEndpointPath $st.EndpointPath
     # Bind the outside guards to all currently installed non-tunnel adapters, including disconnected ones.
     $aliases=@(Get-NetAdapter | Where-Object {$_.Name -ne 'rn-public'} | ForEach-Object Name)
     if (-not $aliases.Count -or ($aliases | Where-Object {[Management.Automation.WildcardPattern]::ContainsWildcardCharacters($_)})) {throw 'Unsupported interface alias.'}
@@ -221,9 +299,7 @@ function EnableMode{
     # All IPv6 unicast except loopback / link-local; leave local discovery and IPv4 intact.
     New-NetFirewallRule -Name ($st.Tag+'-v6') -DisplayName 'RackNerd Connection: IPv4-only Internet' -Group $st.Tag -Direction Outbound -Action Block -Profile Any -RemoteAddress '::2-fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff','fec0::/10' -PolicyStore PersistentStore | Out-Null
     if(@(Get-NetFirewallRule -PolicyStore ActiveStore -Group $st.Tag | Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Block' }).Count -ne 3){throw 'Effective DNS and IPv6 firewall rules incomplete'}
-    if (Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -DestinationPrefix $endpointPrefix -ErrorAction SilentlyContinue) {throw 'Endpoint route changed during preflight.'}
-    Mark 'route.intent'
-    New-NetRoute -AddressFamily IPv4 -DestinationPrefix $endpointPrefix -InterfaceIndex $st.K -NextHop $st.GW -PolicyStore ActiveStore -RouteMetric $st.RouteMetric | Out-Null
+    New-RnEndpointRoute
     Mark 'svc.intent'; Start-RnManualTunnel | Out-Null
     if(Has 'stop.requested'){throw 'Local recovery requested'}
     Mark 'doh.intent'
@@ -244,7 +320,7 @@ function EnableMode{
     Mark 'proxy.intent'; Set-RnProxyDirect -Snapshot $st.Proxy | Out-Null
     Clear-DnsClientCache
     foreach($target in '1.1.1.1','9.9.9.9','208.67.222.222'){if(@(Find-NetRoute -RemoteIPAddress $target | Where-Object DestinationPrefix)[0].InterfaceAlias -ne 'rn-public'){throw "Unexpected route to $target"}}
-    if(@(Find-NetRoute -RemoteIPAddress $endpoint | Where-Object DestinationPrefix)[0].InterfaceIndex -ne $st.K){throw 'Endpoint route lost'}
+    Assert-RnEndpointPath $st.EndpointPath -Pinned -Metric $st.RouteMetric
     $good=$false
     foreach($url in 'https://api.ipify.org','https://www.cloudflare.com/cdn-cgi/trace','https://ipv4.icanhazip.com'){
         if(Has 'stop.requested'){throw 'Local recovery requested'}
