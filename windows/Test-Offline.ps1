@@ -70,7 +70,7 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
 & {
     # Full preflight reaches an in-memory snapshot only. All platform reads use
     # fixtures; the stop in Export-Clixml occurs before a state file can be written.
-    foreach($n in 'Get-RnEndpointPath','Assert-RnEndpointPath','Assert-RnEndpointRouteAvailable','NewState') { . (Read-TestFunction 'Gateway-Mode.ps1' $n) }
+    foreach($n in 'Get-RnEndpointPath','Assert-RnCurrentUplink','Assert-RnEndpointRouteAvailable','NewState') { . (Read-TestFunction 'Gateway-Mode.ps1' $n) }
     $current='fixture-state';$store='fixture-root';$endpoint='198.51.100.8';$endpointPrefix=$endpoint+'/32';$sid='fixture-user'
     $net=@(
         [pscustomobject]@{DestinationPrefix='0.0.0.0/0';NextHop='192.0.2.1';InterfaceIndex=7;RouteMetric=1},
@@ -146,8 +146,8 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     function Assert-Snapshot([int]$Index,[string]$Hop) {
         $observations.Clear()
         Rejected {NewState 'Test'} 'Fixture: captured snapshot'
-        Check ($script:st.K -eq $Index -and $script:st.GW -ceq $Hop) 'Did not follow Windows actual endpoint route'
-        Check ($script:st.EndpointPath.InterfaceIndex -eq $Index -and $script:st.AdapterGuid -ceq $script:st.EndpointPath.AdapterGuid) 'Endpoint selection was not saved'
+        Check ($script:st.EndpointPath.InterfaceIndex -eq $Index -and $script:st.EndpointPath.NextHop -ceq $Hop) 'Did not observe Windows actual endpoint route'
+        Check ($script:st.RouteMode -ceq 'EndpointExclusion' -and -not $script:st.PSObject.Properties['RouteMetric'] -and -not $script:st.PSObject.Properties['K']) 'A new session must not plan a physical endpoint pin'
         Check ($observations.Count -eq 2) 'Endpoint path was not rechecked before snapshot'
     }
     Assert-Snapshot 7 '192.0.2.1'
@@ -175,17 +175,15 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     $devices[0].Status='Disconnected';Rejected {Get-RnEndpointPath $endpoint} 'disconnected';$devices[0].Status='Up'
     $interfaces[0].ConnectionState='Disconnected';Rejected {Get-RnEndpointPath $endpoint} 'disconnected';$interfaces[0].ConnectionState='Connected'
     $devices[0].HardwareInterface=$false;Rejected {Get-RnEndpointPath $endpoint} 'VPN or TUN';$devices[0].HardwareInterface=$true
-    $saved=Get-RnEndpointPath $endpoint
-    $sourceOverride='192.0.2.123';Rejected {Assert-RnEndpointPath $saved} 'changed during';$sourceOverride=''
-    $devices[0].InterfaceGuid='fixture-reused-index';Rejected {Assert-RnEndpointPath $saved} 'changed during';$devices[0].InterfaceGuid='fixture-ethernet-id'
-    $selectedHop='192.0.2.2';Rejected {Assert-RnEndpointPath $saved} 'changed during';$selectedHop='192.0.2.1'
-    $changeOnSecond=$true;$observations.Clear();Rejected {NewState 'Test'} 'changed during';$changeOnSecond=$false
-    $selectedPrefix=$endpointPrefix;$selectedMetric=9000
-    Assert-RnEndpointPath $saved -Pinned -Metric 9000
-    Rejected {Assert-RnEndpointPath $saved -Pinned -Metric 8999} 'changed during'
-    $selectedIndex=8;Rejected {Assert-RnEndpointPath $saved -Pinned -Metric 9000} 'changed during';$selectedIndex=7
-    $selectedPrefix='0.0.0.0/0';Rejected {Assert-RnEndpointPath $saved -Pinned -Metric 9000} 'changed during'
-    $selectedMetric=1
+    $sourceOverride='192.0.2.123';Assert-RnCurrentUplink;$sourceOverride=''
+    $devices[0].InterfaceGuid='fixture-reused-index';Assert-RnCurrentUplink;$devices[0].InterfaceGuid='fixture-ethernet-id'
+    $selectedHop='192.0.2.2';Assert-RnCurrentUplink;$selectedHop='192.0.2.1'
+    $changeOnSecond=$true;Assert-Snapshot 7 '192.0.2.1';$changeOnSecond=$false
+    # A new native choice is accepted, but a pin found only by the final lookup
+    # (after store enumeration) must still fail the no-pin invariant.
+    $selectedIndex=8;Assert-RnCurrentUplink;$selectedIndex=7
+    $selectedPrefix=$endpointPrefix;Rejected {Assert-RnCurrentUplink} 'specific endpoint'
+    $selectedPrefix='0.0.0.0/0'
     $vpn=$true;Rejected {NewState 'Test'} 'active VPN';$vpn=$false
     $devices[1].HardwareInterface=$false;Rejected {NewState 'Test'} 'VPN or TUN';$devices[1].HardwareInterface=$true
     $net+=[pscustomobject]@{DestinationPrefix='128.0.0.0/1';NextHop='0.0.0.0';InterfaceIndex=8}
@@ -200,6 +198,71 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     $persistent=@([pscustomobject]@{DestinationPrefix='2001:db8::/32'})
     Assert-Snapshot 7 '192.0.2.1' # No IPv4 routes in PersistentStore is a valid state.
     Check ($net[0].RouteMetric -eq 1 -and $net[1].RouteMetric -eq 900) 'Preflight changed existing routes'
+}
+& {
+    # Validate the controller's ongoing checks against a moving native uplink.
+    foreach($n in 'Assert-RnCurrentUplink','Assert-RnEndpointRouteAvailable','Assert-RnInternetRoutes') {. (Read-TestFunction 'Gateway-Mode.ps1' $n)}
+    $endpoint='198.51.100.8';$endpointPrefix=$endpoint+'/32'
+    $complete=$true;$chosenIndex=7;$chosenPrefix='0.0.0.0/0';$probeAlias='rn-public';$duplicate=$false
+    $pinStore='';$reads=[Collections.Generic.List[string]]::new()
+    function Test-RnRoamingRoutes($Endpoint,$TunnelName){Check ($TunnelName -ceq 'rn-public') 'Wrong tunnel checked';$complete}
+    function Get-NetRoute($PolicyStore,$ErrorAction){
+        Check ($ErrorAction -ceq 'Stop') 'Uplink store reads must surface errors'
+        if($PolicyStore -ceq $pinStore){[pscustomobject]@{DestinationPrefix=$endpointPrefix}}
+    }
+    function Get-RnEndpointPath($RemoteIPAddress){
+        Check ($RemoteIPAddress -ceq $endpoint) 'Wrong endpoint checked'
+        [pscustomobject]@{InterfaceIndex=$chosenIndex;DestinationPrefix=$chosenPrefix}
+    }
+    function Find-NetRoute($RemoteIPAddress,$ErrorAction){
+        Check ($ErrorAction -ceq 'Stop' -and $RemoteIPAddress -ne $endpoint) 'Endpoint must not be a tunneled traffic probe'
+        [void]$reads.Add($RemoteIPAddress)
+        [pscustomobject]@{DestinationPrefix='fixture-prefix';InterfaceAlias=$probeAlias}
+        if($duplicate){[pscustomobject]@{DestinationPrefix='fixture-prefix';InterfaceAlias=$probeAlias}}
+    }
+    Assert-RnInternetRoutes
+    $chosenIndex=8;Assert-RnInternetRoutes
+    Check ($reads.Count -eq 6) 'Ongoing checks did not follow physical uplink changes'
+    $complete=$false;Rejected {Assert-RnInternetRoutes} 'do not exclude';$complete=$true
+    $probeAlias='fixture-physical';Rejected {Assert-RnInternetRoutes} 'Unexpected route to';$probeAlias='rn-public'
+    $duplicate=$true;Rejected {Assert-RnInternetRoutes} 'Unexpected route to';$duplicate=$false
+    foreach($pinStore in 'ActiveStore','PersistentStore'){Rejected {Assert-RnInternetRoutes} 'specific endpoint'}
+    $pinStore='';$chosenPrefix=$endpointPrefix;Rejected {Assert-RnInternetRoutes} 'specific endpoint';$chosenPrefix='0.0.0.0/0'
+    $endpoint='1.1.1.1';$endpointPrefix=$endpoint+'/32';$reads.Clear()
+    Assert-RnInternetRoutes
+    Check ($reads.Count -eq 2 -and $reads -notcontains $endpoint) 'An endpoint equal to a probe must remain direct'
+}
+& {
+    # Execute real startup orchestration only up to the DNS step. All writes are
+    # fixtures, and no external executable or machine API can be reached.
+    . (Read-TestFunction 'Gateway-Mode.ps1' 'EnableMode')
+    $endpoint='198.51.100.8';$st=[pscustomobject]@{Tag='fixture';Doh=@([pscustomobject]@{ServerAddress='1.1.1.1'})}
+    $events=[Collections.Generic.List[string]]::new();$routeFailure=$false;$stopAfter=''
+    function Has($Name){$Name -ceq 'stop.requested' -and $stopAfter -and $events.Contains($stopAfter)}
+    function Assert-RnCurrentUplink{[void]$events.Add('physical')}
+    function Get-NetAdapter{[pscustomobject]@{Name='fixture-physical'}}
+    function New-NetFirewallRule{[void]$events.Add('guard')}
+    function Get-NetFirewallRule{foreach($n in 1..3){[pscustomobject]@{Enabled='True';Action='Block'}}}
+    function Mark($Name){[void]$events.Add($Name)}
+    function Start-RnManualTunnel{[void]$events.Add('start')}
+    function Enable-RnRoamingRoutes($Endpoint,$TunnelName){
+        Check ($Endpoint -ceq $endpoint -and $TunnelName -ceq 'rn-public') 'Wrong conversion target'
+        [void]$events.Add('exclude');if($routeFailure){throw 'Fixture route conversion failed'}
+    }
+    function Assert-RnInternetRoutes{[void]$events.Add('verify')}
+    function Set-DnsClientDohServerAddress{throw 'Fixture stop before DNS mutation'}
+    function New-NetRoute{throw 'A physical pin must never be created'}
+    Rejected {EnableMode} 'Fixture stop before DNS mutation'
+    Check (($events -join ',') -ceq 'physical,guard,guard,guard,svc.intent,start,exclude,verify,doh.intent') 'Route conversion must immediately follow service start'
+    $events.Clear();$routeFailure=$true
+    Rejected {EnableMode} 'Fixture route conversion failed'
+    Check (($events -join ',') -ceq 'physical,guard,guard,guard,svc.intent,start,exclude') 'Failed conversion continued configuration'
+    $events.Clear();$routeFailure=$false;$stopAfter='start'
+    Rejected {EnableMode} 'Local recovery requested'
+    Check (($events -join ',') -ceq 'physical,guard,guard,guard,svc.intent,start') 'Recovery requested during startup still changed routes'
+    $events.Clear();$stopAfter='exclude'
+    Rejected {EnableMode} 'Local recovery requested'
+    Check (($events -join ',') -ceq 'physical,guard,guard,guard,svc.intent,start,exclude') 'Recovery requested during conversion still changed DNS or proxy'
 }
 & {
     . (Read-TestFunction 'Gateway-Mode.ps1' 'Test-RnTrialQualifies')
@@ -239,16 +302,17 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     Check (($events -join ',') -ceq 'service,cache,proxy') 'Rollback was not idempotent'
 }
 & {
-    # Exercise actual endpoint create/remove functions with no OS mutations.
-    foreach($n in 'Assert-RnEndpointRouteAvailable','New-RnEndpointRoute','Remove-RnEndpointRoute','UndoMachine') {. (Read-TestFunction 'Gateway-Mode.ps1' $n)}
+    # Old sessions retain their exact pin ownership and recovery rules. New
+    # roaming sessions have no route.intent and cannot delete physical routes.
+    foreach($n in 'Assert-RnEndpointRouteAvailable','Remove-RnEndpointRoute','UndoMachine') {. (Read-TestFunction 'Gateway-Mode.ps1' $n)}
     $endpointPrefix='198.51.100.8/32';$boot=[datetime]'2020-01-01'
     $st=[pscustomobject]@{K=8;GW='0.0.0.0';RouteMetric=9000;AdapterGuid='fixture-wlan';Boot=$boot.ToUniversalTime().ToString('o');RouteOwnershipVersion=2;EndpointPath='fixture'}
     $net=[Collections.Generic.List[object]]::new()
     $original=[pscustomobject]@{DestinationPrefix='0.0.0.0/0';InterfaceIndex=8;NextHop='192.0.2.1';RouteMetric=99}
     $net.Add($original)
     $persistent=@()
-    $marks=@{};$calls=[Collections.Generic.List[string]]::new()
-    $createFailure=$false;$providerFailure=$false;$adapterFailure=$false;$retainRoute=$false;$actualGuid='fixture-wlan'
+    $marks=@{}
+    $providerFailure=$false;$adapterFailure=$false;$retainRoute=$false;$actualGuid='fixture-wlan'
     function Has($n) {[bool]$marks[$n]}
     function Mark($n) {$marks[$n]=$true}
     function Get-NetRoute($AddressFamily,$PolicyStore,$ErrorAction) {
@@ -259,16 +323,7 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
             $persistent
         }else{$net}
     }
-    function Assert-RnEndpointPath($Expected,[switch]$Pinned,[int]$Metric) {
-        if($Pinned){Check ($Metric -eq $st.RouteMetric) 'Wrong expected route metric';[void]$calls.Add('after')}
-        else {[void]$calls.Add('before')}
-    }
-    function New-NetRoute($AddressFamily,$DestinationPrefix,$InterfaceIndex,$NextHop,$PolicyStore,$RouteMetric,$ErrorAction) {
-        Check ($AddressFamily -ceq 'IPv4' -and $PolicyStore -ceq 'ActiveStore' -and $ErrorAction -ceq 'Stop') 'Wrong route creation scope'
-        Check ($DestinationPrefix -ceq $endpointPrefix -and $InterfaceIndex -eq 8 -and $NextHop -ceq '0.0.0.0') 'Route did not use the actual on-link endpoint'
-        $net.Add([pscustomobject]@{DestinationPrefix=$DestinationPrefix;InterfaceIndex=$InterfaceIndex;NextHop=$NextHop;RouteMetric=$RouteMetric})
-        if($createFailure){throw 'Fixture concurrent route caused creation to fail'}
-    }
+    function Add-FixturePin{$net.Add([pscustomobject]@{DestinationPrefix=$endpointPrefix;InterfaceIndex=8;NextHop='0.0.0.0';RouteMetric=9000})}
     function Get-CimInstance($ClassName) {[pscustomobject]@{LastBootUpTime=$boot}}
     function Get-NetAdapter($ErrorAction) {
         Check ($ErrorAction -ceq 'Stop') 'Recovery must distinguish a failed adapter provider from absence'
@@ -279,17 +334,17 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
         [CmdletBinding()]param([Parameter(ValueFromPipeline)]$InputObject,[switch]$Confirm)
         process {Check ($InputObject.DestinationPrefix -ceq $endpointPrefix) 'Touched an unrelated route';if(-not $retainRoute){[void]$net.Remove($InputObject)}}
     }
-    New-RnEndpointRoute
-    Check ($marks['route.created'] -and ($calls -join ',') -ceq 'before,after') 'Successful pin was not recorded and verified'
+    Add-FixturePin
+    Remove-RnEndpointRoute
+    Check ($net.Count -eq 2) 'A new roaming session acquired ownership of a physical route'
+    $marks['route.intent']=$true;$marks['route.created']=$true
     Remove-RnEndpointRoute;Remove-RnEndpointRoute
     Check ($net.Count -eq 1 -and [object]::ReferenceEquals($net[0],$original)) 'Recovery changed the existing default'
     $persistent=@([pscustomobject]@{DestinationPrefix=$endpointPrefix;InterfaceIndex=8;NextHop='192.0.2.1';RouteMetric=8})
-    Rejected {New-RnEndpointRoute} 'specific endpoint route already exists in PersistentStore'
+    Rejected {Assert-RnEndpointRouteAvailable} 'specific endpoint route already exists in PersistentStore'
     Check ($net.Count -eq 1 -and $persistent.Count -eq 1) 'Persistent route was overwritten'
     $persistent=@()
-    $marks.Clear();$createFailure=$true
-    Rejected {New-RnEndpointRoute} 'Fixture concurrent route'
-    Check ($marks['route.intent'] -and -not $marks['route.created']) 'Failed creation acquired route ownership'
+    $marks.Clear();$marks['route.intent']=$true;Add-FixturePin
     Rejected {Remove-RnEndpointRoute} 'creation was not confirmed'
     Check ($net.Count -eq 2) 'Concurrent route was removed after failed creation'
     $marks['route.created']=$true
@@ -326,4 +381,4 @@ foreach ($n in 0,65536,53,853) { Rejected {Assert-RnUdpPort $n} 'port' }
     Remove-RnEndpointRoute # A disconnected machine may expose no IPv4 rows.
     Check ($net.Count -eq 0) 'Empty ActiveStore recovery changed routes'
 }
-'Offline validation passed: actual dual-adapter selection, stable endpoint pinning, on-link routes, conflicts, ownership, rollback and existing setup checks.'
+'Offline validation passed: native uplink changes, endpoint exclusion orchestration, conflicts, legacy ownership, rollback and existing setup checks.'

@@ -18,6 +18,13 @@ $cases=@{
     'The active Xray TUN enforces its own DNS'='Tun'
     'Another VPN or TUN adapter is active'='Tun'
     'A specific endpoint route already exists'='Route'
+    'Endpoint subnet overlaps an existing physical or VPN route; original routing must be preserved.'='RouteOverlap'
+    'Unexpected route: WireGuard routes do not exclude the VPS endpoint correctly.'='RouteCoverage'
+    'WireGuard default halves are incomplete before endpoint routing.'='RouteCoverage'
+    'Endpoint routing verification failed.'='RouteCoverage'
+    'Unexpected WireGuard endpoint route configuration.'='RouteCoverage'
+    'Unexpected existing WireGuard route during endpoint routing.'='RouteCoverage'
+    'WireGuard adapter is not ready for endpoint routing.'='Service'
     'DNS policy not effective after 20 seconds'='Dns'
     'Could not verify the VPS as the no-proxy IPv4 exit'='Exit'
     'No recent handshake with the enrolled server'='Handshake'
@@ -32,6 +39,9 @@ $cases=@{
     'An unrecognized fixture failure'='Unknown'
 }
 Check ((Get-RnFailureInfo 'Windows endpoint route selection is ambiguous or incomplete.').Help.Contains('两张物理网卡可以同时在线')) 'Dual physical network guidance is missing'
+Check ((Get-RnFailureInfo 'Endpoint subnet overlaps an existing physical or VPN route').Help.Contains('保留现有路由')) 'Overlap guidance must preserve existing networks'
+Check ((Get-RnFailureInfo 'Endpoint routing verification failed.').Reason.Contains('VPS 地址仍被导入隧道')) 'Endpoint-exclusion failure is not explained'
+Check ((Get-RnFailureInfo 'WireGuard adapter is not ready for endpoint routing.').Reason.Contains('隧道网卡尚未就绪')) 'Adapter readiness failure is not explained'
 foreach($message in $cases.Keys){
     $r=Invoke-RnPanelOperation {throw $message}
     Check (-not $r.Success -and $r.Failure.Code -ceq $cases[$message]) ('Wrong error classification: '+$message)

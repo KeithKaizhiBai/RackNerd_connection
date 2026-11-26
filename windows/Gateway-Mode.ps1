@@ -22,9 +22,10 @@ if ($Action -eq 'Status' -and -not $admin) {
 if (-not $admin) {throw 'Use an elevated local Windows PowerShell under the signed-in desktop account.'}
 $store=Join-Path $base 'State'
 Assert-RnProtectedPath $store -Private
-foreach ($helper in 'Gateway-Mode.ps1','Gateway-Service.ps1','Gateway-WinInet.ps1') {Assert-RnProtectedPath (Join-Path $base $helper)}
+foreach ($helper in 'Gateway-Mode.ps1','Gateway-Service.ps1','Gateway-WinInet.ps1','Gateway-Routes.ps1') {Assert-RnProtectedPath (Join-Path $base $helper)}
 . (Join-Path $base 'Gateway-WinInet.ps1')
 . (Join-Path $base 'Gateway-Service.ps1')
+. (Join-Path $base 'Gateway-Routes.ps1')
 function New-SessionDirectory([string]$path) {
     if(Test-Path -LiteralPath $path){throw 'Unexpected state directory collision'}
     $acl=New-Object Security.AccessControl.DirectorySecurity
@@ -194,15 +195,6 @@ function Get-RnEndpointPath([string]$RemoteIPAddress) {
         DestinationPrefix=[string]$route.DestinationPrefix;RouteMetric=[int]$route.RouteMetric
     }
 }
-function Assert-RnEndpointPath($Expected,[switch]$Pinned,[int]$Metric) {
-    $now=Get-RnEndpointPath $Expected.RemoteIPAddress
-    $prefix=if($Pinned){$Expected.RemoteIPAddress+'/32'}else{$Expected.DestinationPrefix}
-    if($now.InterfaceIndex -ne $Expected.InterfaceIndex -or $now.AdapterGuid -ne $Expected.AdapterGuid -or
-        $now.NextHop -ne $Expected.NextHop -or $now.SourceAddress -ne $Expected.SourceAddress -or
-        $now.DestinationPrefix -ne $prefix -or ($Pinned -and $now.RouteMetric -ne $Metric)) {
-        throw 'Windows endpoint route changed during the switch. Restore Original and retry on a stable network.'
-    }
-}
 function Assert-RnEndpointRouteAvailable {
     foreach($scope in 'ActiveStore','PersistentStore') {
         # Do not filter the provider by IPv4: an empty family can raise a CIM
@@ -212,13 +204,23 @@ function Assert-RnEndpointRouteAvailable {
         }
     }
 }
-function New-RnEndpointRoute {
+function Assert-RnCurrentUplink {
+    # No physical /32 is installed. The OS may select a different physical
+    # adapter/source/next hop at any time, including while setup is in progress.
     Assert-RnEndpointRouteAvailable
-    Assert-RnEndpointPath $st.EndpointPath
-    Mark 'route.intent'
-    New-NetRoute -AddressFamily IPv4 -DestinationPrefix $endpointPrefix -InterfaceIndex $st.K -NextHop $st.GW -PolicyStore ActiveStore -RouteMetric $st.RouteMetric -ErrorAction Stop | Out-Null
-    Mark 'route.created'
-    Assert-RnEndpointPath $st.EndpointPath -Pinned -Metric $st.RouteMetric
+    $path=Get-RnEndpointPath $endpoint
+    if($path.DestinationPrefix -eq $endpointPrefix){throw 'A specific endpoint route already exists; it will not be replaced.'}
+}
+function Assert-RnInternetRoutes {
+    if(-not (Test-RnRoamingRoutes -Endpoint $endpoint -TunnelName 'rn-public')) {
+        throw 'Unexpected route: WireGuard routes do not exclude the VPS endpoint correctly.'
+    }
+    Assert-RnCurrentUplink
+    $targets=@('1.1.1.1','9.9.9.9','208.67.222.222') | Where-Object {$_ -ne $endpoint}
+    foreach($target in $targets) {
+        $path=@(Find-NetRoute -RemoteIPAddress $target -ErrorAction Stop | Where-Object DestinationPrefix)
+        if($path.Count -ne 1 -or $path[0].InterfaceAlias -ne 'rn-public') {throw "Unexpected route to $target"}
+    }
 }
 function NewState($kind){
     if(Test-Path -LiteralPath $current){
@@ -266,13 +268,10 @@ function NewState($kind){
     $proxy=Get-RnProxySnapshot -ExpectedSid $sid
     $doh=@(Get-DnsClientDohServerAddress -ServerAddress '1.1.1.1','9.9.9.9' | Select-Object ServerAddress,DohTemplate,AutoUpgrade,AllowFallbackToUdp)
     if($doh.Count -ne 2 -or ($doh | Where-Object {$_.DohTemplate -notin 'https://cloudflare-dns.com/dns-query','https://dns.quad9.net/dns-query'})){throw 'Unexpected native DNS-over-HTTPS templates'}
-    Assert-RnEndpointPath $selectedEndpoint
+    Assert-RnCurrentUplink
     $script:Id=[guid]::NewGuid().ToString('N'); $script:td=Join-Path $store $Id; New-SessionDirectory $td
-    $script:st=[pscustomobject]@{Id=$Id;Kind=$kind;UserSid=$sid;K=$selectedEndpoint.InterfaceIndex;GW=$selectedEndpoint.NextHop;Tag="RNPublic-$Id";Proxy=$proxy;Net=(NetBaseline);Boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')}
-    Add-Member -InputObject $st -NotePropertyName RouteMetric -NotePropertyValue (Get-Random -Minimum 3500 -Maximum 29000)
-    Add-Member -InputObject $st -NotePropertyName AdapterGuid -NotePropertyValue $selectedEndpoint.AdapterGuid
+    $script:st=[pscustomobject]@{Id=$Id;Kind=$kind;UserSid=$sid;RouteMode='EndpointExclusion';Tag="RNPublic-$Id";Proxy=$proxy;Net=(NetBaseline);Boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')}
     Add-Member -InputObject $st -NotePropertyName EndpointPath -NotePropertyValue $selectedEndpoint
-    Add-Member -InputObject $st -NotePropertyName RouteOwnershipVersion -NotePropertyValue 2
     Add-Member -InputObject $st -NotePropertyName Doh -NotePropertyValue $doh
     $st | Export-Clixml -LiteralPath (Join-Path $td 'baseline.xml')
     [IO.File]::WriteAllText($current,$Id)
@@ -288,7 +287,7 @@ function LoadState{
 }
 function EnableMode{
     if (Has 'stop.requested'){throw 'Local recovery requested'}
-    Assert-RnEndpointPath $st.EndpointPath
+    Assert-RnCurrentUplink
     # Bind the outside guards to all currently installed non-tunnel adapters, including disconnected ones.
     $aliases=@(Get-NetAdapter | Where-Object {$_.Name -ne 'rn-public'} | ForEach-Object Name)
     if (-not $aliases.Count -or ($aliases | Where-Object {[Management.Automation.WildcardPattern]::ContainsWildcardCharacters($_)})) {throw 'Unsupported interface alias.'}
@@ -299,9 +298,11 @@ function EnableMode{
     # All IPv6 unicast except loopback / link-local; leave local discovery and IPv4 intact.
     New-NetFirewallRule -Name ($st.Tag+'-v6') -DisplayName 'RackNerd Connection: IPv4-only Internet' -Group $st.Tag -Direction Outbound -Action Block -Profile Any -RemoteAddress '::2-fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff','fec0::/10' -PolicyStore PersistentStore | Out-Null
     if(@(Get-NetFirewallRule -PolicyStore ActiveStore -Group $st.Tag | Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Block' }).Count -ne 3){throw 'Effective DNS and IPv6 firewall rules incomplete'}
-    New-RnEndpointRoute
     Mark 'svc.intent'; Start-RnManualTunnel | Out-Null
     if(Has 'stop.requested'){throw 'Local recovery requested'}
+    Enable-RnRoamingRoutes -Endpoint $endpoint -TunnelName 'rn-public'
+    if(Has 'stop.requested'){throw 'Local recovery requested'}
+    Assert-RnInternetRoutes
     Mark 'doh.intent'
     foreach($old in $st.Doh){Set-DnsClientDohServerAddress -ServerAddress $old.ServerAddress -AutoUpgrade $true -AllowFallbackToUdp $false}
     Add-DnsClientNrptRule -Namespace '.' -NameServers '1.1.1.1','9.9.9.9' -Comment $st.Tag -DisplayName $st.Tag
@@ -319,8 +320,7 @@ function EnableMode{
     if(-not $policyOK){throw ('DNS policy not effective after 20 seconds; matching rules='+$effective.Count+' resolvers='+($seenDns -join ','))}
     Mark 'proxy.intent'; Set-RnProxyDirect -Snapshot $st.Proxy | Out-Null
     Clear-DnsClientCache
-    foreach($target in '1.1.1.1','9.9.9.9','208.67.222.222'){if(@(Find-NetRoute -RemoteIPAddress $target | Where-Object DestinationPrefix)[0].InterfaceAlias -ne 'rn-public'){throw "Unexpected route to $target"}}
-    Assert-RnEndpointPath $st.EndpointPath -Pinned -Metric $st.RouteMetric
+    Assert-RnInternetRoutes
     $good=$false
     foreach($url in 'https://api.ipify.org','https://www.cloudflare.com/cdn-cgi/trace','https://ipv4.icanhazip.com'){
         if(Has 'stop.requested'){throw 'Local recovery requested'}
@@ -338,6 +338,7 @@ function EnableMode{
     $age=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()-[long]$pair[1]
     if ($age -lt 0 -or $age -gt 180) {throw 'No recent handshake with the enrolled server.'}
     if (-not @(Resolve-DnsName -Name 'example.com' -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Where-Object IPAddress).Count) { throw 'Native Windows DNS did not return an IPv4 address.' }
+    Assert-RnInternetRoutes
     Trace-Line 'Physical endpoint, WireGuard handshake, native DNS and direct public IPv4 exit verified.'
 }
 switch($Action){

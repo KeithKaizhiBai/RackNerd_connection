@@ -27,6 +27,11 @@ $script:fixtureEndpointAmbiguous = $false
 $script:fixtureEndpointSourceMode = 'Normal'
 $script:fixtureWlanConnected = $true
 $script:fixtureEndpointChange = $false
+$script:fixtureLegacyRoutes = $false
+$script:fixtureMissingPrefix = $false
+$script:fixturePinStore = ''
+$script:fixtureEndpointPrefix = '0.0.0.0/0'
+$script:fixtureProviderFailure = $false
 $script:publicRequests = 0
 function Get-NetIPInterface {
     [pscustomobject]@{InterfaceIndex=12; InterfaceMetric=5; ConnectionState='Connected'}
@@ -36,19 +41,30 @@ function Get-NetIPInterface {
 function New-TestRoute([string]$Prefix, [int]$Index, [string]$Adapter) {
     [pscustomobject]@{DestinationPrefix=$Prefix; InterfaceIndex=$Index; InterfaceAlias=$Adapter; RouteMetric=1; NextHop='0.0.0.0'}
 }
-function Get-NetRoute {
+function Get-NetRoute($PolicyStore,$AddressFamily,$ErrorAction) {
+    Assert-Equal 'Stop' $ErrorAction 'Route read errors must be visible'
+    Assert-Equal $false $PSBoundParameters.ContainsKey('AddressFamily') 'Empty IPv4 stores are enumerated safely'
+    if($script:fixtureProviderFailure){throw 'Fixture route provider failed'}
+    if($PolicyStore -eq $script:fixturePinStore){New-TestRoute ($script:fixtureIp+'/32') 12 'Ethernet'}
+    if($PolicyStore -eq 'PersistentStore'){return}
     New-TestRoute '0.0.0.0/0' 12 'Ethernet'
     New-TestRoute '0.0.0.0/0' 16 'WLAN'
     if (-not $script:fixtureRunning) { return }
-    New-TestRoute '0.0.0.0/1' 14 'rn-public'
-    New-TestRoute '128.0.0.0/1' 14 'rn-public'
+    if($script:fixtureLegacyRoutes){
+        New-TestRoute '0.0.0.0/1' 14 'rn-public'
+        New-TestRoute '128.0.0.0/1' 14 'rn-public'
+    }else{
+        $prefixes=@(Get-RnInternetPrefixes $script:fixtureIp)
+        if($script:fixtureMissingPrefix){$prefixes=$prefixes[0..30]}
+        foreach($prefix in $prefixes){New-TestRoute $prefix 14 'rn-public'}
+    }
     if ($script:fixtureCompetition) { New-TestRoute '0.0.0.0/1' 12 'Ethernet' }
 }
 function Get-NetAdapter {
     [pscustomobject]@{Name='Ethernet'; HardwareInterface=$true; Status='Up'; ifIndex=12; InterfaceGuid='fixture-ethernet'}
     [pscustomobject]@{Name='WLAN'; HardwareInterface=$true; Status='Up'; ifIndex=16; InterfaceGuid='fixture-wlan'}
     $state = if ($script:fixtureRunning) { 'Up' } else { 'Disconnected' }
-    [pscustomobject]@{Name='rn-public'; HardwareInterface=$false; Status=$state; ifIndex=14}
+    [pscustomobject]@{Name='rn-public'; HardwareInterface=$false; Status=$state; ifIndex=14;InterfaceDescription='WireGuard Tunnel'}
 }
 function Get-Service {
     $state = if ($script:fixtureRunning) { 'Running' } else { 'Stopped' }
@@ -60,10 +76,22 @@ function Get-RnProxyFlags {
     $script:fixtureProxy
 }
 function Find-NetRoute([string]$RemoteIPAddress) {
-    Assert-Equal $script:fixtureIp $RemoteIPAddress 'Endpoint from public settings'
+    if($RemoteIPAddress -ne $script:fixtureIp){
+        Assert-Equal $true ($RemoteIPAddress -in '1.1.1.1','9.9.9.9','208.67.222.222') 'Ordinary IPv4 route target'
+        if($script:fixtureRunning -and -not $script:fixtureCompetition){
+            $prefix=@(Get-RnInternetPrefixes $script:fixtureIp | Where-Object {Test-RnPrefixContains $_ $RemoteIPAddress})
+            Assert-Equal 1 $prefix.Count 'Probe has one expected roaming prefix'
+            New-TestRoute $prefix[0] 14 'rn-public'
+            [pscustomobject]@{IPAddress='10.203.84.2';InterfaceIndex=14;AddressState='Preferred';SkipAsSource=$false}
+        }else{
+            New-TestRoute '0.0.0.0/0' 12 'Ethernet'
+            [pscustomobject]@{IPAddress='192.0.2.12';InterfaceIndex=12;AddressState='Preferred';SkipAsSource=$false}
+        }
+        return
+    }
     if ($script:fixturePhysical) {
         $name=if($script:fixtureEndpointIndex -eq 12){'Ethernet'}else{'WLAN'}
-        $route=New-TestRoute ($RemoteIPAddress+'/32') $script:fixtureEndpointIndex $name
+        $route=New-TestRoute $script:fixtureEndpointPrefix $script:fixtureEndpointIndex $name
         $route.NextHop=$script:fixtureEndpointHop
     } else {$route=New-TestRoute '128.0.0.0/1' 14 'rn-public'}
     $route
@@ -88,12 +116,16 @@ function Read-TestView {
     Get-RnPanelView $sample.Local $sample.Check
 }
 
-Assert-Equal 'Verified' (Read-TestView).Kind 'Matching routes, source, endpoint and public IP'
+Assert-Equal 'Verified' (Read-TestView).Kind 'Endpoint-excluding routes, physical default, source and public IP'
+Assert-Equal 'rn-public → Ethernet' (Get-RnLocalPath (Get-RnSettings)).Route 'Status reports current physical uplink'
 $script:fixtureEndpointIndex=16
 Assert-Equal 'Verified' (Read-TestView).Kind 'Windows selected WLAN while both physical adapters are online'
+Assert-Equal 'rn-public → WLAN' (Get-RnLocalPath (Get-RnSettings)).Route 'Status follows native selected WLAN'
 $script:fixtureEndpointHop='0.0.0.0'
+$script:fixtureEndpointPrefix='203.0.113.0/24'
 Assert-Equal 'Verified' (Read-TestView).Kind 'Actual physical endpoint is on-link'
 $script:fixtureEndpointHop='192.0.2.1'
+$script:fixtureEndpointPrefix='0.0.0.0/0'
 $script:fixtureWlanConnected=$false
 Assert-Equal 'Warning' (Read-TestView).Kind 'Endpoint cannot use IPv4-disconnected WLAN'
 $script:fixtureWlanConnected=$true
@@ -107,13 +139,31 @@ $script:fixtureEndpointSourceMode='Normal'
 $script:fixtureEndpointIndex=12;$script:fixtureEndpointChange=$true
 Assert-Equal 'Pending' (Read-TestView).Kind 'Physical endpoint changed during public probe'
 $script:fixtureEndpointChange=$false
+Assert-Equal 'Verified' (Read-TestView).Kind 'Fresh public probe accepts the changed physical uplink'
+foreach($script:fixturePinStore in 'ActiveStore','PersistentStore'){
+    Assert-Equal 'Warning' (Read-TestView).Kind ('Endpoint pin retained in '+$script:fixturePinStore)
+}
+$script:fixturePinStore=''
+$script:fixtureEndpointPrefix=$script:fixtureIp+'/32'
+Assert-Equal 'Warning' (Read-TestView).Kind 'Native lookup still finds a pin'
+$script:fixtureEndpointPrefix='0.0.0.0/0'
+$script:fixtureLegacyRoutes=$true
+Assert-Equal 'Warning' (Read-TestView).Kind 'Unconverted pair of half-defaults still covers the endpoint'
+$script:fixtureLegacyRoutes=$false
+$script:fixtureMissingPrefix=$true
+Assert-Equal 'Warning' (Read-TestView).Kind 'Missing narrow sibling route is not a complete gateway'
+$script:fixtureMissingPrefix=$false
+$script:fixtureProviderFailure=$true
+$unreadable=Get-RnPanelSample $true
+Assert-Equal 'Unknown' (Get-RnPanelView $unreadable.Local $unreadable.Check).Kind 'Route provider failures cannot report a good path'
+$script:fixtureProviderFailure=$false
 $script:fixtureProxy = $null
 Assert-Equal 'Warning' (Read-TestView).Kind 'Uncertain system proxy'
 $script:fixtureProxy = 9
 Assert-Equal 'Warning' (Read-TestView).Kind 'Automatic discovery is enabled'
 $script:fixtureProxy = 1
 $script:fixtureCompetition = $true
-Assert-Equal 'Warning' (Read-TestView).Kind 'Equal-cost competing route'
+Assert-Equal 'Warning' (Read-TestView).Kind 'Windows selects a competing route for ordinary traffic'
 $script:fixtureCompetition = $false
 $script:fixturePhysical = $false
 Assert-Equal 'Warning' (Read-TestView).Kind 'Endpoint inside the tunnel'

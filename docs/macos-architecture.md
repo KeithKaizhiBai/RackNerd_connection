@@ -12,7 +12,7 @@
 | 本地控制 | `Gateway-Mode.ps1` 调用服务、路由、DNS、代理和恢复函数 | 官方界面负责日常连接；`rn-mac` 用于准备、检查和限时试验 |
 | 图形界面 | `gui/Gateway-Panel.ps1` 调用 PowerShell 控制器并轮询实际线路 | 使用官方 WireGuard 界面 |
 | 私钥 | Windows 本机生成，DPAPI 保护的配置由 SYSTEM 使用 | Mac 本机独立生成；导入官方应用，准备文件限制为当前用户可读写 |
-| IPv4 路由 | 两条 `/1` 加物理网卡到 VPS 的 `/32` | NetworkExtension 使用 IPv4 默认路由；试连时核验外层 UDP 的物理路径 |
+| IPv4 路由 | 隧道路由排除 VPS 公网地址，VPS 随 Windows 在可用物理网卡间选路 | NetworkExtension 使用 IPv4 默认路由；试连时核验外层 UDP 的物理路径 |
 | DNS | NRPT、系统加密 DNS、Windows 防火墙限制隧道外 DNS | 隧道配置指定 DNS，另行核查原生解析器、路由及 DNS 实际出口 |
 | IPv6 | 临时 Windows 防火墙规则限制公网 IPv6 | 配置本地 ULA 地址及两条 IPv6 半默认路由，服务器仅授权 Mac IPv4 源地址；须验证没有物理出口泄漏 |
 | 恢复 | SYSTEM 与桌面用户的计划任务分别恢复网络和代理 | 先验证 launchd 中独立运行的恢复进程；到期调用原生 VPN 断开接口 |

@@ -48,7 +48,7 @@ WireGuard 的两把私钥在各自机器生成。SSH 管理密钥用于登录服
 | 确认是否生效 | 在面板查看本机线路、网卡、实测公网出口和核验时间。绿色需要本机 WireGuard 路由和绕过应用代理的真实出口同时符合预期。 |
 | 回原网络 | 选择 **返回原网络**。如果原来使用 v2rayN TUN，重新打开它。 |
 
-Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路由覆盖普通 IPv4 流量。系统加密 DNS 经隧道发送。此配置采用 IPv4 出口，运行期间限制其他公网 IPv6 路径。切换工具负责保存并恢复 Windows 的代理、DNS 和专用路由。v2rayN 客户端可以退出，它的 TUN 开关由用户操作。
+Windows 让 VPS 公网地址使用系统当下选中的物理线路。WireGuard 接管其余公网 IPv4 流量，系统加密 DNS 经隧道发送。日常会话允许有线与 Wi-Fi 自动切换。控制器保留物理网卡原有默认路由和优先级，退出时撤回本次配置的代理、DNS、隧道接口和相关规则。v2rayN 的 TUN 仍需在其客户端关闭。
 
 只想从终端查看状态时，在仓库根目录运行 `.\gui\RackNerd-Network.cmd Status`。面板最小化后可从托盘打开，关闭窗口后隧道继续按所选模式运行。
 
@@ -64,21 +64,24 @@ Windows 保留物理网关到 VPS 公网端点的路径，再用两条 `/1` 路�
 
 ## 连接前检查修复与验证
 
-**Wi-Fi 和有线网可以同时在线。** 关闭 v2rayN 的“启用 TUN”，保留两张物理网卡，点击“连接 RackNerd”或“试用 15 分钟”。每次连接时，控制器都会用 `Find-NetRoute` 查询 Windows 到 VPS 公网 IPv4 的实际路由和源地址，确认选中的是已连接的物理网卡，再为该 VPS 建立临时的单地址路由。两张网卡原有的默认路由和优先级保持原值。
+**连接期间可以拔插网线。** Wi-Fi 已连接时，拔掉网线后 Windows 会重新选择到 VPS 的线路。插回网线后，如果 Windows 优先选择有线，隧道就会切回有线；如果仍优先 Wi-Fi，就继续使用 Wi-Fi。整个过程中保持 RackNerd 连接。网络重新协商时，正在传输的请求可能短暂等待或需要重试。
 
-旧控制器要求恰好一个物理出口，两张网卡都可用时可能提示 `Need one unambiguous physical IPv4 default route`。新版按目的地选路，也会复查接口、下一跳和源地址。其他 VPN/TUN 占用端点、已有该 VPS 的单地址路由，或连接过程中线路变化时，按面板提示处理。连接期间如果需要更换承载隧道的物理网卡，点“返回原网络”，等新线路就绪后重新连接。[验收与恢复](../docs/verify-and-recover.md)
+隧道启动后，控制器在本次 WireGuard 网卡上细分原有的两条 IPv4 路由，使它们覆盖除 VPS 公网地址以外的地址空间。VPS 地址继续由 Windows 的普通路由表处理，公网 SSH 和 WireGuard 都能跟随当前物理线路。若新网段会与已有局域网或 VPN 路由争夺流量，控制器会终止试用并恢复原网络。[验收与恢复](../docs/verify-and-recover.md)
 
-已有公开版安装先在面板选择 **返回原网络**，确认已恢复，再关闭面板。用同一桌面管理员账户核对安装目录 `%ProgramFiles%\RackNerd-Connection` 的 `State` 中当前会话具有 `machine.ok`、`user.ok`，且本工具的 `RNPublic-*` 恢复任务已清理。备份该目录中的 `Gateway-Mode.ps1` 和 `Gateway-Feedback.ps1`，用本仓库 `windows/` 下的同名文件更新，保留目标文件的管理员写入权限。若本地有定制修改，请先核对差异。用本版本配套的 `gui/` 目录重新打开面板，从 **试用 15 分钟** 开始验收，再恢复原网络。
+已有公开版安装先选择 **返回原网络**，确认已恢复并关闭旧面板。使用同一桌面管理员账户核对安装目录 `%ProgramFiles%\RackNerd-Connection` 中当前会话的 `machine.ok`、`user.ok`，确认该会话的恢复任务已清理。备份已安装的控制器，然后将本版本的 `windows/Gateway-Mode.ps1`、`windows/Gateway-Routes.ps1` 和 `windows/Gateway-Feedback.ps1` 放入该目录，保留管理员写入权限。用本版本配套的 `gui/` 和 `windows/` 目录重新打开面板，从 **试用 15 分钟** 开始验收。新安装会自动安装所需文件。
 
-在仓库根目录运行下面三个离线测试，无需管理员权限。虚构接口和文档保留地址用于检查双网卡选路、断开或虚拟网卡、线路变化、恢复及面板提示。
+在仓库根目录运行下面四项离线测试，无需管理员权限。覆盖范围包括网段是否恰好只排除一个端点、与局域网路由冲突时的回退、双网卡选路、恢复及面板提示。
 
 ```powershell
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Offline.ps1
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Roaming.ps1
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\gui\Test-Status.ps1
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File .\windows\Test-Feedback.ps1
 ```
 
-实际 Windows 部署在 Wi-Fi 和有线网同时在线时完成了“试用 → 返回原网络 → 再次连接”。Windows 当次选择有线网，两次连接的端点网卡、下一跳和源地址均与连接前一致。WireGuard 握手、面板出口核验、系统 DNS 和 HTTPS 请求通过。回退后已核对原有默认路由、端点路由及试用规则和任务的清理。公开版的选路函数也在同一台机器上与 Windows 的实际结果作了对照。Windows 选中 Wi-Fi 的情形由离线回归覆盖。
+在安装公开版的工作站上，可按[双网卡实测步骤](../docs/verify-and-recover.md)核对同一 WireGuard 会话中的两个切换方向。
+
+在实际 Windows 工作站上，验证程序短暂停用有线网卡，再将同一网卡启用，模拟网线拔插。Wi-Fi 接手及有线恢复两个阶段均保留同一 WireGuard 进程和控制器会话。两个阶段的新请求均验证了隧道收发、预期公网出口、系统 DNS 和 HTTPS。随后验证了返回原网络和再次开启日常连接。现场地址、记录和设备标识只保存在本机。
 
 ## 公开版与实际部署
 

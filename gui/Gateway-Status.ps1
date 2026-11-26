@@ -1,5 +1,6 @@
 ﻿#requires -Version 5.1
 # Shared by the graphical panel and its read-only Status command.
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'windows\Gateway-Routes.ps1')
 $script:RnInstallRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'RackNerd-Connection'
 $script:RnTunnelName = 'rn-public'
 $script:RnClientAddress = '10.203.84.2'
@@ -99,31 +100,11 @@ function Get-RnLocalPath($Settings) {
 
     $interfaces = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop |
         Where-Object ConnectionState -eq 'Connected')
-    $metrics = @{}
-    foreach ($iface in $interfaces) { $metrics[[int]$iface.InterfaceIndex] = [int]$iface.InterfaceMetric }
-    $routes = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop |
-        Where-Object { $metrics.ContainsKey([int]$_.InterfaceIndex) -and
-            $_.DestinationPrefix -in '0.0.0.0/0', '0.0.0.0/1', '128.0.0.0/1' })
-    $both = $true
+    $allRoutes = @(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop)
+    $routes = @($allRoutes | Where-Object { $_.InterfaceIndex -in $interfaces.InterfaceIndex -and
+        $_.DestinationPrefix -notmatch ':' })
     $used = @()
     $identity = @($Settings.Endpoint)
-    foreach ($prefix in '0.0.0.0/1', '128.0.0.0/1') {
-        $choices = @($routes | Where-Object DestinationPrefix -eq $prefix)
-        if (-not $choices.Count) {
-            $both = $false
-            $choices = @($routes | Where-Object DestinationPrefix -eq '0.0.0.0/0')
-        }
-        if (-not $choices.Count) { throw 'Windows has no active IPv4 default route.' }
-        $ranked = @($choices | Select-Object *, @{Name='TotalMetric'; Expression={
-            [int]$_.RouteMetric + $metrics[[int]$_.InterfaceIndex]
-        }} | Sort-Object TotalMetric, InterfaceIndex)
-        # Equal-cost routes on another adapter make the outgoing path ambiguous.
-        foreach ($r in ($ranked | Where-Object TotalMetric -eq $ranked[0].TotalMetric)) {
-            $used += $r.InterfaceAlias
-            $identity += @($r.DestinationPrefix, $r.InterfaceIndex, $r.NextHop, $r.TotalMetric)
-            if ($r.InterfaceAlias -ne $script:RnTunnelName) { $both = $false }
-        }
-    }
     $adapters = @(Get-NetAdapter -ErrorAction Stop)
     $physical = @($adapters | Where-Object { $_.HardwareInterface -and $_.Status -eq 'Up' -and
         $_.ifIndex -in $interfaces.InterfaceIndex })
@@ -139,36 +120,61 @@ function Get-RnLocalPath($Settings) {
             $_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource })
     }
 
+    # Both halves still belong to the peer's AllowedIPs. Their Windows routes
+    # exclude one address so ordinary SSH and outer UDP can follow Windows uplink changes.
+    $both = Test-RnRoamingRoutes -Endpoint $Settings.Endpoint -TunnelName $script:RnTunnelName
+    $targets = @('1.1.1.1', '9.9.9.9', '208.67.222.222') | Where-Object { $_ -ne $Settings.Endpoint }
+    foreach ($target in $targets) {
+        $answer = @(Find-NetRoute -RemoteIPAddress $target -ErrorAction Stop)
+        $chosen = @($answer | Where-Object DestinationPrefix)
+        $chosenSource = @($answer | Where-Object IPAddress)
+        $used += @($chosen | ForEach-Object InterfaceAlias)
+        foreach ($r in $chosen) { $identity += @($target, $r.DestinationPrefix, $r.InterfaceIndex, $r.NextHop, $r.RouteMetric) }
+        foreach ($s in $chosenSource) { $identity += @($s.InterfaceIndex, $s.IPAddress, $s.AddressState, $s.SkipAsSource) }
+        if ($chosen.Count -ne 1 -or $chosenSource.Count -ne 1 -or -not $tunnel -or
+            $chosen[0].InterfaceIndex -ne $tunnel.ifIndex -or $chosen[0].InterfaceAlias -ne $script:RnTunnelName -or
+            $chosenSource[0].InterfaceIndex -ne $tunnel.ifIndex -or $chosenSource[0].IPAddress -ne $script:RnClientAddress -or
+            $chosenSource[0].AddressState -ne 'Preferred' -or $chosenSource[0].SkipAsSource -ne $false) { $both = $false }
+    }
+
     $endpointAnswer = @(Find-NetRoute -RemoteIPAddress $Settings.Endpoint -ErrorAction Stop)
     $endpointRoutes = @($endpointAnswer | Where-Object DestinationPrefix)
     $endpointSources = @($endpointAnswer | Where-Object IPAddress)
     $endpoint = if ($endpointRoutes.Count -eq 1) { $endpointRoutes[0] } else { $null }
     $endpointSource = if ($endpointSources.Count -eq 1) { $endpointSources[0] } else { $null }
+    # A leftover or externally supplied endpoint /32 must not masquerade as a
+    # roaming route. Enumerate both stores without an IPv4 provider filter.
+    $endpointPrefix = $Settings.Endpoint + '/32'
+    $persistentRoutes = @(Get-NetRoute -PolicyStore PersistentStore -ErrorAction Stop)
+    $hasPin = [bool](@($allRoutes + $persistentRoutes) | Where-Object DestinationPrefix -eq $endpointPrefix)
     $physicalEndpoint = $endpoint -and $endpointSource -and
-        $endpoint.DestinationPrefix -eq ($Settings.Endpoint + '/32') -and
+        -not $hasPin -and $endpoint.DestinationPrefix -ne $endpointPrefix -and
         $endpoint.InterfaceIndex -in $physical.ifIndex -and $endpointSource.InterfaceIndex -eq $endpoint.InterfaceIndex -and
         $endpointSource.AddressState -eq 'Preferred' -and $endpointSource.SkipAsSource -eq $false -and
-        (Test-RnIPv4Literal ([string]$endpointSource.IPAddress))
+        (Test-RnIPv4Literal ([string]$endpointSource.IPAddress)) -and
+        (Test-RnIPv4Literal ([string]$endpoint.NextHop)) -and $endpointSource.IPAddress -ne $Settings.Endpoint
     $endpointAdapter = @($physical | Where-Object ifIndex -eq $endpoint.InterfaceIndex)
-    if ($endpointAdapter.Count -ne 1) { $physicalEndpoint=$false }
+    if ($endpointAdapter.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$endpointAdapter[0].InterfaceGuid)) { $physicalEndpoint=$false }
     $used = @($used | Select-Object -Unique)
     $otherTun = [bool]($adapters | Where-Object {
         $driver = $_.Name + ' ' + $_.InterfaceDescription
         $knownTunnel = $driver -match 'xray_tun|wintun|wireguard|openvpn|tap-windows|tailscale|zerotier'
-        $tunnelRoute = $_.Name -in $used -and $_.InterfaceType -in 23, 53, 131
+        $tunnelRoute = $_.Name -in $routes.InterfaceAlias -and $_.InterfaceType -in 23, 53, 131
         $_.Status -eq 'Up' -and $_.Name -ne $script:RnTunnelName -and ($knownTunnel -or $tunnelRoute)
     })
     try { $flags = Get-RnProxyFlags } catch { $flags = $null }
     $hasGateway = ($tunnel -and $tunnel.Status -eq 'Up') -or
         ($service -and $service.Status -ne 'Stopped') -or $script:RnTunnelName -in $used
-    $identity += @($serviceState, $flags, $hasGateway, $both, $source, $physicalEndpoint, $otherTun,
+    $identity += @($serviceState, $flags, $hasGateway, $both, $source, $physicalEndpoint, $otherTun, $hasPin,
         $endpoint.InterfaceIndex, $endpoint.DestinationPrefix, $endpoint.NextHop, $endpointSource.IPAddress,
         $endpointAdapter.InterfaceGuid, $endpointRoutes.Count, $endpointSources.Count)
+    $routeText = $used -join ' / '
+    if ($hasGateway -and $physicalEndpoint) { $routeText += ' → ' + $endpointAdapter[0].Name }
     [pscustomobject]@{
         Key=($identity -join '|'); At=$now; Config='Ready'; Endpoint=$Settings.Endpoint
         Service=$serviceState; HasGateway=$hasGateway; Both=$both; HasSource=$source
         PhysicalEndpoint=[bool]$physicalEndpoint; OtherTun=$otherTun; Direct=($flags -eq 1)
-        Proxy=(Get-RnProxyText $flags); Route=($used -join ' / ')
+        Proxy=(Get-RnProxyText $flags); Route=$routeText
     }
 }
 

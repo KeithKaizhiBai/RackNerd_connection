@@ -4,7 +4,7 @@
 
 ## Windows 是否真正经 VPS 上网
 
-双网卡验收时保持 Wi-Fi 和有线网在线，关闭其他客户端的 TUN。将 `$VpsIPv4` 设为自己的 VPS 公网地址，在连接前、试用中、返回原网络后三次运行下面一行。Windows 会分别返回路由和源地址。试用中的端点前缀应为 `/32`，网卡、下一跳和源地址应与连接前一致。返回原网络后，临时路由应消失，端点应恢复原来的前缀。切换期间保持相同的物理线路条件，以便比较结果。
+连接 Wi-Fi 和有线网，关闭其他 TUN。将 `$VpsIPv4` 设为自己的 VPS 公网 IPv4。开始试用后保持同一 RackNerd 会话，在拔线前、拔线后和插回网线后三次运行下面的命令。每次都应看到 Windows 为 VPS 选中的物理网卡和源地址。拔线后应选中 Wi-Fi，插回后以 Windows 实际选路为准。
 
 ```powershell
 Find-NetRoute -RemoteIPAddress $VpsIPv4 |
@@ -24,7 +24,9 @@ Resolve-DnsName www.python.org -Type A -DnsOnly
 ping -4 10.203.84.1
 ```
 
-两个公网目标应分别选中覆盖 IPv4 地址空间两半的 WireGuard 路由，本地源地址是 `10.203.84.2`。VPS 公网地址本身应走物理网卡，这样 WireGuard 的外层 UDP 数据包能到达 VPS。在近端可查看 Windows DNS 客户端的有效策略和加密 DNS 设置。在远端用 `rn-gateway status` 检查握手及收发量，用 `nft list table ip rn_public_gateway` 对照公网请求前后的转发与 NAT 计数。
+两个普通公网目标应选中 WireGuard 网卡，公开版示例的本地请求源地址为 `10.203.84.2`。VPS 地址保留在系统的物理路由上。每次切换后用新的 HTTPS 请求核对出口，查看 WireGuard 收发字节是否都在增加。漫游可沿用现有握手，无须为每次拔插重新连接。
+
+需要验证“有线 → Wi-Fi → 有线”两个方向时，先确认双网卡均已联网，Windows 当前优先选择有线。在本机管理员 PowerShell 从仓库根目录运行 `.\windows\Test-LiveRoaming.ps1`，按提示实际拔插网线。脚本观察已运行的公开版连接，核对同一服务进程和会话、物理线路、新的隧道收发流量、DNS 和 HTTPS。插回后 Windows 若仍优先选择 Wi-Fi，RackNerd 会留在 Wi-Fi，这时没有发生可供验收的有线回切。
 
 ```powershell
 Get-DnsClientNrptPolicy -Effective | Select-Object Namespace,NameServers
@@ -61,7 +63,7 @@ python -c "import urllib.request as u; h=u.build_opener(u.ProxyHandler({})); r=h
 |---|---|
 | 双网卡在线时旧版提示物理网关不唯一 | 按[Windows 指南](../windows/README.md#连接前检查修复与验证)更新控制器及面板。两张网卡都可保留，重试前用上面的命令查看到 VPS 的实际线路。如果选中其他 VPN 的虚拟网卡，先关闭对应 TUN。 |
 | SSH 能登录，WireGuard 没握手 | 核对双方公钥、端点地址和 UDP 端口。检查控制面板及系统防火墙的 UDP 入站。 |
-| 能 ping VPS 私网，公网不通 | 核对客户端的两条 IPv4 路由、VPS 的 IPv4 转发、限源转发规则和 NAT 回包计数。 |
+| 能 ping VPS 私网，公网不通 | 核对客户端隧道的 IPv4 路由集合、VPS 的 IPv4 转发、限源转发规则和 NAT 回包计数。 |
 | 已知地址的 HTTPS 能通，普通域名失败 | 核对 Windows 有效 DNS 策略和加密 DNS 的路由。若 v2rayN TUN 已启用，先恢复原网络，再关闭该开关后重新试用。其 DNS 过滤可能在另一个接口被选中时仍然生效。 |
 | 窗口显示隧道已启用、出口待确认 | 点击面板的出口核验，或运行上面两个独立检查，确认本机 DNS、公网出口服务和线路可达。 |
 | 时延高、网页载入慢 | 分开测物理网关、VPS 公网、隧道私网和应用 HTTPS。将 TCP 建连、TLS、服务器首字节和总用时分别记录。 |

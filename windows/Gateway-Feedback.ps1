@@ -24,6 +24,15 @@ function Get-RnFailureInfo([string]$Message) {
         'Cleanup failed|recovery.*fail|restor.*fail|still present|still needs rollback|restoration failed|Resolver settings changed externally|flags differ' {
             $code='Recovery';$reason='恢复相关操作报错，最终状态需要核验。';$help='先查看当前线路，再点击“返回原网络”确认恢复，使用最初连接时的 Windows 账户操作。确认恢复后再开启其他 TUN。';break
         }
+        'Endpoint subnet overlaps an existing physical or VPN route' {
+            $code='RouteOverlap';$reason='新线路会覆盖现有局域网或 VPN 路由，已停止切换。';$help='先返回原网络，保留现有路由。核对 VPS 地址与本机的直连或 VPN 网段；若确实重叠，换用不重叠的 VPS 端点，或请管理员检查路由。';break
+        }
+        'WireGuard routes do not exclude|WireGuard default halves are incomplete|Endpoint routing verification failed|Unexpected WireGuard endpoint route configuration|Unexpected existing WireGuard route during endpoint routing' {
+            $code='RouteCoverage';$reason='WireGuard 路由未完整建立，或 VPS 地址仍被导入隧道。';$help='先点击“返回原网络”，等待本次隧道退出后重试。仍失败时检查是否有其他软件改动了 rn-public 的路由，并查看错误详情；保留物理网卡的原有路由。';break
+        }
+        'WireGuard adapter is not ready for endpoint routing' {
+            $code='Service';$reason='WireGuard 隧道网卡尚未就绪，无法设置上网路由。';$help='点击“返回原网络”，确认旧的 rn-public 隧道已退出后重试。若持续出现，检查官方 WireGuard 的安装及服务状态。';break
+        }
         'Xray TUN|VPN or TUN|virtual network is active|active VPN|competing VPN' {
             $code='Tun';$reason='其他 VPN 或 TUN 正在占用网络。';$help='先在 v2rayN 或对应 VPN 客户端中关闭 TUN/断开连接，再点击连接 RackNerd。';break
         }
